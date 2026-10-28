@@ -1,0 +1,15 @@
+.git
+.pytest_cache
+.coverage
+coverage.xml
+.venv
+__pycache__
+*.py[cod]
+tests
+infra
+.github
+k8s
+.ruff_cache
+.env
+.env.*
+!.env.example
