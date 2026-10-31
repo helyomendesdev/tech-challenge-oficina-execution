@@ -17,6 +17,17 @@ class Settings:
     outbox_poll_interval_seconds: float
 
     def __post_init__(self) -> None:
+        required_fields = {
+            "EXECUTION_COMMANDS_QUEUE_URL": self.commands_queue_url,
+            "SAGA_RESPONSES_QUEUE_URL": self.responses_queue_url,
+            "EXECUTION_DYNAMODB_TABLE": self.dynamodb_table,
+            "AWS_REGION": self.aws_region,
+        }
+
+        for name, value in required_fields.items():
+            if not value.strip():
+                raise ValueError(f"{name} must not be empty")
+
         if not 1 <= self.visibility_timeout <= 43200:
             raise ValueError("EXECUTION_VISIBILITY_TIMEOUT_SECONDS must be between 1 and 43200")
 
@@ -28,9 +39,6 @@ class Settings:
 
         if self.outbox_poll_interval_seconds <= 0:
             raise ValueError("EXECUTION_OUTBOX_POLL_INTERVAL_SECONDS must be greater than zero")
-
-        if not self.aws_region.strip():
-            raise ValueError("AWS_REGION must not be empty")
 
         if self.log_level.upper() not in {
             "DEBUG",
