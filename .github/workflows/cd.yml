@@ -1,0 +1,205 @@
+name: CD
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-execution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate application
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run Ruff
+        run: ruff check .
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      - name: Run tests
+        run: python -m pytest -v --tb=short
+
+  build-push-deploy:
+    name: Build, push and deploy
+    needs: validate
+    if: ${{ vars.EXECUTION_DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      K8S_SERVICE_ACCOUNT: ${{ vars.EXECUTION_K8S_SERVICE_ACCOUNT }}
+      EXECUTION_COMMANDS_QUEUE_URL: ${{ vars.EXECUTION_COMMANDS_QUEUE_URL }}
+      SAGA_RESPONSES_QUEUE_URL: ${{ vars.SAGA_RESPONSES_QUEUE_URL }}
+      EXECUTION_DYNAMODB_TABLE: ${{ vars.EXECUTION_DYNAMODB_TABLE }}
+      KUBECTL_VERSION: ${{ vars.KUBECTL_VERSION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            AWS_REGION
+            ECR_REPOSITORY
+            EKS_CLUSTER_NAME
+            K8S_NAMESPACE
+            K8S_SERVICE_ACCOUNT
+            EXECUTION_COMMANDS_QUEUE_URL
+            SAGA_RESPONSES_QUEUE_URL
+            EXECUTION_DYNAMODB_TABLE
+            KUBECTL_VERSION
+          )
+
+          for var in "${required_vars[@]}"; do
+            if [[ -z "${!var:-}" ]]; then
+              echo "::error::Required variable $var is not configured."
+              exit 1
+            fi
+          done
+
+          if [[ -z "${{ secrets.AWS_ROLE_ARN }}" ]]; then
+            echo "::error::AWS_ROLE_ARN secret is not configured."
+            exit 1
+          fi
+
+          if [[ ! -f k8s/configmap.yaml.template ]]; then
+            echo "::error::ConfigMap template not found."
+            exit 1
+          fi
+
+          if [[ ! -f k8s/deployment.yaml.template ]]; then
+            echo "::error::Deployment template not found."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          docker build --pull -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Install envsubst
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext-base
+
+      - name: Update kubeconfig
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Render Kubernetes manifests
+        env:
+          EXECUTION_IMAGE: ${{ steps.image.outputs.uri }}
+          EXECUTION_LOG_LEVEL: INFO
+          EXECUTION_VISIBILITY_TIMEOUT_SECONDS: "30"
+          EXECUTION_SQS_WAIT_TIME_SECONDS: "20"
+          EXECUTION_SQS_ERROR_BACKOFF_SECONDS: "2"
+          EXECUTION_OUTBOX_POLL_INTERVAL_SECONDS: "5"
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/execution"
+
+          envsubst '${AWS_REGION} ${EXECUTION_COMMANDS_QUEUE_URL} ${SAGA_RESPONSES_QUEUE_URL} ${EXECUTION_DYNAMODB_TABLE} ${EXECUTION_LOG_LEVEL} ${EXECUTION_VISIBILITY_TIMEOUT_SECONDS} ${EXECUTION_SQS_WAIT_TIME_SECONDS} ${EXECUTION_SQS_ERROR_BACKOFF_SECONDS} ${EXECUTION_OUTBOX_POLL_INTERVAL_SECONDS}' \
+            < k8s/configmap.yaml.template \
+            > "$RUNNER_TEMP/execution/configmap.yaml"
+
+          envsubst '${EXECUTION_IMAGE} ${K8S_SERVICE_ACCOUNT}' \
+            < k8s/deployment.yaml.template \
+            > "$RUNNER_TEMP/execution/deployment.yaml"
+
+      - name: Apply ConfigMap
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            -n "$K8S_NAMESPACE" \
+            -f "$RUNNER_TEMP/execution/configmap.yaml"
+
+      - name: Apply Deployment
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            -n "$K8S_NAMESPACE" \
+            -f "$RUNNER_TEMP/execution/deployment.yaml"
+
+      - name: Wait for deployment rollout
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status deployment/execution-service \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+      - name: Show deployment diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get deployment execution-service \
+            -n "$K8S_NAMESPACE" || true
+
+          kubectl get pods \
+            -n "$K8S_NAMESPACE" \
+            -l app.kubernetes.io/name=execution-service \
+            -o wide || true
+
+          kubectl describe pods \
+            -n "$K8S_NAMESPACE" \
+            -l app.kubernetes.io/name=execution-service || true
