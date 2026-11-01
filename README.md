@@ -92,8 +92,9 @@ automaticamente a DLQ.
   comando/evento de conclusão nem um adapter de trabalho mecânico que permita
   produzir essas respostas com segurança. Não há transição de sucesso/falha
   simulada.
-- O contrato público está na branch `contrato/v1`; a branch `main` do
-  repositório da Saga contém somente o README.
+- O repositório `tech-challenge-oficina-saga` mantém o AsyncAPI e os schemas v1
+  em `main`. O AsyncAPI identifica a v1 como proposta para revisão do grupo;
+  a aprovação dos mantenedores continua necessária para qualquer extensão.
 - O serviço propaga `traceparent`/`tracestate` como message attributes, mas não
   exporta spans para New Relic ou outro collector e não implementa métricas.
   Os eventos de log são emitidos em JSON com identificadores de mensagem,
@@ -118,6 +119,70 @@ nem ownership de estoque para o novo serviço. Por isso, essas operações
 originais não foram copiadas para o DynamoDB nem substituídas por sucesso
 simulado; concluir o ciclo requer definir o adapter/ownership e o comando de
 trabalho mecânico.
+
+### Bloqueio para o ciclo individual dos serviços
+
+O contrato v1 disponível não permite iniciar/finalizar serviços individualmente
+nem fazer a validação de consumo antes de mudar um serviço para
+`EM_EXECUCAO`. A fila de comandos define `IniciarExecucao` e `CancelarExecucao`;
+as respostas incluem `ExecucaoIniciada`, `ExecucaoFinalizada`,
+`ExecucaoFalhou` e `ExecucaoCancelada`. Não existem comandos de início/fim por
+serviço, retorno de aceite/rejeição do OS Service ou mensagem de consumo por
+serviço. `ExecucaoFinalizada` só contém `execucaoId` e `finalizadaEm`.
+
+No modelo atual do OS Service, `servicoId` é numérico e único por OS pela
+restrição `(ordem_servico, servico)`, portanto `(osId, servicoId)` identifica o
+serviço enquanto essa invariável for mantida. Para peças, `pecaId` não
+identifica necessariamente uma reserva específica: a OS pode ter linhas
+`ItemPecaOS` distintas para a mesma peça, e o consumo legado relaciona essas
+linhas a um item de serviço. O contrato v1 não inclui o identificador da linha
+reservada.
+
+Por isso, o Execution Service não pode implementar com segurança, usando apenas
+o contrato atual, a sequência “registrar consumo → aguardar validação/aceite do
+OS → marcar serviço `EM_EXECUCAO`”, nem comunicar o consumo por linha da OS. A
+tentativa pendente também não pode ser descartada quando houver incerteza sobre
+se a validação ou o consumo foram aplicados. Não se deve reutilizar ou ampliar
+unilateralmente `IniciarExecucao`, `ExecucaoFinalizada` ou outros tipos v1 para
+representar essas operações.
+
+O fluxo permanece bloqueado até OS/Saga aprovarem e publicarem os contratos
+necessários para: (1) comandos de início e fim por serviço; (2) solicitação e
+resposta de aceite/rejeição do consumo pelo OS Service, incluindo correlação
+idempotente; e (3) comunicação do consumo com referência suficiente para a OS
+identificar suas reservas. A conclusão no wire deve preservar
+`ExecucaoFinalizada`; `EXECUTION_COMPLETED` é somente o evento interno de
+domínio, não um segundo tipo de mensagem. Depois desse alinhamento, será
+possível implementar a transição pendente de forma retomável, a Outbox com
+todas as saídas atômicas e os respectivos handlers/testes, sem acesso ao banco
+de outro microsserviço.
+
+#### Núcleo de domínio local
+
+`execution_service/domain/service_execution.py` contém a máquina de estados
+local por serviço (`PENDENTE`, `INICIO_PENDENTE`, `EM_EXECUCAO` e `CONCLUIDO`),
+validação positiva das quantidades e IDs de reserva (`itemPecaOSId` + `pecaId`),
+confirmação explícita do início **e do consumo**, rejeição explícita e
+idempotência da tentativa corrente por UUID de mensagem. O chamador só deve
+aplicar confirmação/rejeição após validar e persistir a decisão correlacionada
+da Saga/OS; a entidade não verifica nem simula essa integração. Timeout ou
+falha não têm transição que limpe `INICIO_PENDENTE`.
+`ExecutionLifecycle` agrega os serviços por OS e produz o evento de domínio
+`EXECUTION_COMPLETED` uma única vez quando todos estão concluídos.
+
+Essas entidades ainda **não estão ligadas** ao consumer, aos Use Cases
+operacionais, ao repositório DynamoDB ou à Outbox. Não gravam confirmação ou
+rejeição da Saga, não enviam consumo ao OS e não publicam `ExecucaoFinalizada`.
+Assim, não há integração simulada nem alegação de fluxo ponta a ponta. O
+próximo passo depende da aprovação dos contratos compartilhados de início/fim,
+consumo e aceite/rejeição; `itemPecaOSId` deve ser aprovado antes de sair em
+mensagens. O domínio mantém somente a tentativa corrente: redeliveries de
+mensagens de tentativas antigas, após novas tentativas e rejeições subsequentes,
+devem ser deduplicadas pelo histórico durável do repositório antes de chamar a
+entidade. A presença do evento em memória não garante publicação única após
+reinício; o futuro repositório deve persistir a transição final e a mensagem
+`ExecucaoFinalizada` na Outbox na mesma transação, com condição/idempotência
+durável. Os testes locais cobrem apenas as regras puras do domínio.
 
 ## Estrutura de testes e versionamento de dados
 
@@ -193,3 +258,41 @@ namespace, IAM role ou ServiceAccount. O deploy só renderiza ConfigMap e
 Deployment do worker. Não execute `terraform apply` nem habilite CD antes do
 alinhamento do `MessageGroupId`, da criação dos recursos compartilhados e da
 confirmação da integração de execução mecânica.
+
+## Use Cases locais para serviços
+
+`execution_service/application/service_execution_use_cases.py` contém Use Cases
+para iniciar, confirmar, rejeitar e finalizar um serviço. O `ExecuteCommandUseCase`
+existente continua responsável pelo comando global v1 `IniciarExecucao`; não foi
+duplicado nem alterado. O início individual persiste no agregado como
+`INICIO_PENDENTE`, incluindo o consumo solicitado, e só passa a
+`EM_EXECUCAO` após a porta `PersistedServiceStartDecisionPort` fornecer uma
+decisão durável, explicitamente correlacionada à OS, serviço e tentativa.
+Timeouts e resultados desconhecidos não são tratados como rejeição.
+
+Esses Use Cases ainda não estão conectados ao consumer ou à composição de
+produção. `ServiceExecutionRepositoryPort` define uma única operação atômica
+para persistir estado, recibo idempotente e eventual Outbox; somente o fake em
+memória implementa essa porta nesta etapa. O repositório DynamoDB e o relay
+existentes persistem o modelo global legado e não leem esses novos registros.
+Assim, os testes verificam o contrato atômico da porta e o comportamento dos
+Use Cases, mas não alegam persistência durável de produção para o agregado por
+serviço.
+
+Quando o último serviço termina, o Use Case mapeia o evento interno
+`EXECUTION_COMPLETED` para o formato v1 já existente `ExecucaoFinalizada` e o
+entrega à mesma fronteira de commit para gravar a Outbox junto ao estado. O
+fluxo ainda não publica essa mensagem em produção: faltam a implementação
+DynamoDB dessa porta, sua integração com o relay e um gatilho de finalização
+individual aprovado. O contrato v1 não define comandos de serviço, retorno de
+aceite/rejeição, nem mensagem de consumo; nenhuma dessas mensagens foi criada.
+Em particular, `itemPecaOSId` permanece dado local e não é enviado ao OS
+Service até aprovação do contrato compartilhado.
+
+A inicialização do agregado por serviço a partir do `IniciarExecucao` global
+também requer uma gravação transacional coordenada com o registro global e sua
+resposta `ExecucaoIniciada`; ela não é feita em duas gravações independentes.
+Até essa evolução e o alinhamento de contratos serem aprovados, os novos Use
+Cases são uma camada local de aplicação, não uma integração ponta a ponta.
+`CancelarExecucao` mantém o comportamento seguro já documentado e não foi
+alterado.

@@ -6,6 +6,14 @@ from .exceptions import (
     TransitionNotAllowedError,
     UnsupportedMessageError,
 )
+from .service_execution import (
+    DomainEventType,
+    ExecutionCompleted,
+    ExecutionLifecycle,
+    PartConsumption,
+    ServiceExecution,
+    ServiceStatus,
+)
 
 __all__ = [
     "ExecutionStatus",
@@ -15,4 +23,10 @@ __all__ = [
     "MessageValidationError",
     "TransitionNotAllowedError",
     "UnsupportedMessageError",
+    "DomainEventType",
+    "ExecutionCompleted",
+    "ExecutionLifecycle",
+    "PartConsumption",
+    "ServiceExecution",
+    "ServiceStatus",
 ]

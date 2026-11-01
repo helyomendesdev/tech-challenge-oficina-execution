@@ -9,4 +9,5 @@ class SagaMessageType(str, Enum):
     INICIAR_EXECUCAO = "IniciarExecucao"
     CANCELAR_EXECUCAO = "CancelarExecucao"
     EXECUCAO_INICIADA = "ExecucaoIniciada"
+    EXECUCAO_FINALIZADA = "ExecucaoFinalizada"
     EXECUCAO_CANCELADA = "ExecucaoCancelada"
