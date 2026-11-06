@@ -18,7 +18,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=10001:10001 execution_service ./execution_service
-COPY --chown=10001:10001 --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# Dono root, modo 755: o usuario 10001 executa o entrypoint, mas nao consegue alterar.
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER 10001:10001
 
