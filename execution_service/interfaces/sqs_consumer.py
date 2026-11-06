@@ -6,6 +6,7 @@ from threading import Event
 from typing import Any
 
 from execution_service.application.use_cases import ExecuteCommandUseCase
+from execution_service.tracing import accept_trace_context, background_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +55,12 @@ class SQSFifoConsumer:
                     raise ValueError("SQS message did not include a ReceiptHandle")
 
                 body = json.loads(message["Body"])
+                attributes = message.get("MessageAttributes", {})
+                message_type = body.get("type") if isinstance(body, dict) else None
 
-                self.processor.handle(
-                    body,
-                    message.get("MessageAttributes", {}),
-                )
+                with background_transaction(message_type or "IniciarExecucao"):
+                    accept_trace_context(attributes)
+                    self.processor.handle(body, attributes)
 
                 self.client.delete_message(
                     QueueUrl=self.queue_url,
