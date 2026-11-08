@@ -105,6 +105,87 @@ usa uma Unit of Work transacional para estado, Inbox e Outbox e um relay de
 eventos pendentes; o Execution mantém essas gravações atômicas em
 `TransactWriteItems` e usa seu relay FIFO recuperável.
 
+### CLI operacional para o driver BDD
+
+`execution_service/cli.py` oferece comandos de processo único para o driver BDD
+invocar o mesmo `ExecutionWorkUseCase` usado pela aplicação. A composição cria
+`DynamoDBExecutionRepository` e precisa de `EXECUTION_DYNAMODB_TABLE` e
+`AWS_REGION` (padrão `us-east-1`); boto3 usa a cadeia padrão de credenciais ou a
+role do container. Não passe credenciais como argumentos.
+
+No container já em execução, use `docker exec <container>`:
+
+```sh
+docker exec execution-service python -m execution_service.cli start-service \
+  --saga-id 11111111-1111-4111-8111-111111111111 \
+  --service-id 101
+
+docker exec execution-service python -m execution_service.cli record-consumption \
+  --saga-id 11111111-1111-4111-8111-111111111111 \
+  --service-id 101 \
+  --part 501:10:2 \
+  --part 502:11:1
+
+docker exec execution-service python -m execution_service.cli finish-service \
+  --saga-id 11111111-1111-4111-8111-111111111111 \
+  --service-id 101
+```
+
+O `saga-id` é o `sagaId` da execução; `service-id` é o `servicoId` da
+solicitação `IniciarExecucao`. Cada `--part` segue
+`ITEM_PECA_OS_ID:PECA_ID:QUANTIDADE` e pode ser repetido. Use os identificadores
+de reserva (`itemPecaOSId` e `pecaId`) da execução. `--message-id` pode ser
+fornecido em qualquer comando para que uma repetição use a mesma chave
+idempotente; sem ele, a CLI gera um UUID novo. `--request-id` é opcional.
+`--started-at` e `--completed-at` também são opcionais, aceitam data/hora ISO
+8601 com fuso, e quando omitidos usam o horário atual.
+Para repetir início/finalização com o mesmo `--message-id`, passe também o
+mesmo timestamp: se omitido, o horário atual é gerado novamente em cada
+invocação. No consumo, repita os mesmos `--part` com a mesma chave.
+
+A sintaxe completa é:
+
+```text
+python -m execution_service.cli start-service --saga-id UUID --service-id ID
+    [--started-at ISO_DATETIME] [--request-id ID] [--message-id UUID]
+python -m execution_service.cli record-consumption --saga-id UUID --service-id ID
+    --part ITEM_PECA_OS_ID:PECA_ID:QUANTIDADE
+    [--part ITEM_PECA_OS_ID:PECA_ID:QUANTIDADE ...]
+    [--request-id ID] [--message-id UUID]
+python -m execution_service.cli finish-service --saga-id UUID --service-id ID
+    [--completed-at ISO_DATETIME] [--request-id ID] [--message-id UUID]
+```
+
+Cada comando válido escreve uma única resposta JSON. Sucesso vai para stdout,
+retorna código `0` e informa `status`, `operation`, `sagaId`, `serviceId`,
+`serviceStatus`, `messageId`, `duplicate`, `executionCompleted` e
+`outboxMessageType`. Erros operacionais vão para stderr, retornam código `1` e
+informam `status: "error"` e `error` (`code`, `type` e `message`). Argumentos
+inválidos vão para stderr no mesmo formato, com código `2` e
+`error.code: "invalid_arguments"`. Exemplo de sucesso:
+
+```json
+{"status":"success","operation":"start-service","sagaId":"11111111-1111-4111-8111-111111111111","serviceId":101,"serviceStatus":"EM_EXECUCAO","messageId":"22222222-2222-4222-8222-222222222222","duplicate":false,"executionCompleted":false,"outboxMessageType":null}
+```
+
+Não há comando para concluir a execução global: o caso de uso conclui a execução
+automaticamente ao finalizar o último serviço, persiste `ExecucaoFinalizada` na
+Outbox e a resposta desse comando contém `"executionCompleted": true` e
+`"outboxMessageType": "ExecucaoFinalizada"`. Também não há comando de falha de
+serviço: o domínio e os casos de uso não implementam falha individual (o estado
+`FALHOU` existente é da execução, não do serviço). A menor extensão exige modelar
+essa transição no domínio/caso de uso e persistir atomicamente o estado e a
+mensagem de falha na Outbox; antes disso é necessário conferir o payload exato
+previsto pelo contrato v1.1.0. A CLI não cria uma mensagem nova para a Saga.
+
+Os exemplos são executados com os IDs reais de uma execução ativa: serviço deve
+pertencer à execução e cada peça/quantidade deve estar reservada e ainda
+disponível. A CLI apenas encaminha a operação ao caso de uso, que mantém as
+validações, idempotência e controle otimista; o repositório salva estado e
+Outbox transacionalmente. A imagem já copia todo o pacote
+`execution_service/`, portanto `Dockerfile` não precisa de alteração. O código
+do Billing não está presente neste checkout; seu padrão não foi duplicado.
+
 ## Estrutura de testes e versionamento de dados
 
 `tests/factories.py` reúne fábricas dos envelopes, comandos, registros e eventos;
