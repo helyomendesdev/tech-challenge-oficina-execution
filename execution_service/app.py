@@ -4,10 +4,12 @@ import logging
 import signal
 import sys
 from threading import Event, Thread
+from typing import Any
 
 import boto3
 
 from execution_service.application.ports import ExecutionRepositoryPort
+from execution_service.application.service_execution_use_cases import ExecutionWorkUseCase
 from execution_service.application.use_cases import ExecuteCommandUseCase
 from execution_service.config import get_settings
 from execution_service.infrastructure.dynamodb_repository import (
@@ -38,6 +40,17 @@ def create_processor(
     return ExecuteCommandUseCase(repository=repository)
 
 
+def create_execution_work_use_case(
+    repository: ExecutionRepositoryPort,
+) -> ExecutionWorkUseCase:
+    return ExecutionWorkUseCase(repository)
+
+
+def create_aws_clients(region_name: str) -> tuple[Any, Any]:
+    session = boto3.Session(region_name=region_name)
+    return session.client("sqs"), session.client("dynamodb")
+
+
 def main() -> None:
     settings = get_settings()
 
@@ -54,15 +67,7 @@ def main() -> None:
 
     logger.info("execution_service_starting")
 
-    sqs_client = boto3.client(
-        "sqs",
-        region_name=settings.aws_region,
-    )
-
-    dynamodb_client = boto3.client(
-        "dynamodb",
-        region_name=settings.aws_region,
-    )
+    sqs_client, dynamodb_client = create_aws_clients(settings.aws_region)
 
     repository = DynamoDBExecutionRepository(
         table_name=settings.dynamodb_table,

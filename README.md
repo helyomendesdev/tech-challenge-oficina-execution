@@ -1,51 +1,40 @@
 # Execution Service
 
-Serviço Python que consome comandos de execução da Saga, mantém o estado em
-DynamoDB e publica a confirmação pelo SQS. O domínio não depende de AWS; a
-composição em `execution_service/app.py` usa os adapters de produção. Os testes
-usam repositório e publisher fakes, sem credenciais nem conta AWS.
+Serviço Python que consome comandos da Saga, persiste estado e Outbox no
+DynamoDB e publica respostas pelo SQS. O domínio não depende de AWS; a
+composição em `execution_service/app.py` usa os adapters de produção.
 
 ## Contrato verificado
 
-Fontes consultadas no branch `contrato/v1` de
-[`tech-challenge-oficina-saga`](https://github.com/helyomendesdev/tech-challenge-oficina-saga/tree/contrato/v1):
+Fontes consultadas na tag v1.1.0 de
+[`tech-challenge-oficina-saga`](https://github.com/helyomendesdev/tech-challenge-oficina-saga/tree/v1.1.0):
 
 - `contrato/asyncapi.yaml`
 - `contrato/schemas/envelope.schema.json`
 - schemas dos comandos e respostas de execução
 - `contrato/saga-estados.yaml`
+- `docs/adr-004-pecas-consumidas.md`
 - `tracing/propagacao-sqs.md`
-- `docs/questoes-abertas.md`
-- `scripts/validar_contrato.py`
 
-O Execution reconhece somente estes tipos de comando no envelope:
+O Execution recebe `IniciarExecucao` e `CancelarExecucao` e responde com
+`ExecucaoIniciada`, `ExecucaoFinalizada` ou `ExecucaoCancelada`. O início e a
+finalização de cada serviço são operações internas, não mensagens da Saga.
+`itemPecaOSId` é opcional em `IniciarExecucao.pecas[]`; quando disponível, o
+Execution rastreia o consumo por reserva e inclui `pecasConsumidas[]` em
+`ExecucaoFinalizada` conforme o formato v1.1.0.
 
-- `IniciarExecucao`, com `orcamentoId`, `servicos` e `pecas`
-- `CancelarExecucao`, com `execucaoId` e `motivo`
+O envelope e os payloads são validados sem adicionar campos ao contrato.
+`traceparent` e `tracestate` são propagados em SQS `MessageAttributes`, nunca
+no corpo. O `requestId`, `sagaId` e `causationId` permanecem no envelope.
 
-`IniciarExecucao` responde com `ExecucaoIniciada`. `CancelarExecucao` é validado,
-mas não é executado nem confirmado: permanece sem exclusão na fila e segue a
-política de redrive para DLQ. O envelope é validado de forma estrita: UUIDs,
-versão 1, campos obrigatórios, ausência de propriedades adicionais, payload e
-data RFC 3339. `traceparent` e `tracestate` são lidos e publicados como SQS
-`MessageAttributes`, nunca no corpo. O `requestId`, `sagaId` e `causationId`
-permanecem no envelope.
-
-O AsyncAPI especifica grupo FIFO igual a `sagaId`, deduplicação igual a
-`messageId`, timeout de visibilidade de 30 segundos e DLQ após cinco
-recebimentos. O publisher v1 em
-`os_service/infrastructure/saga_adapters.py` do OS Service usa
-`os_id_group(os_id)`, que produz `os-{osId}`, divergindo do AsyncAPI. O
-AsyncAPI é a definição normativa que o Execution implementa, mas não é seguro
-alterar unilateralmente o produtor nem presumir qual particionamento o grupo
-quer manter. A integração operacional está bloqueada até a equipe alinhar
-contrato e publisher.
+Para SQS FIFO, `MessageGroupId=sagaId` e
+`MessageDeduplicationId=messageId`.
 
 ## Processamento, retry e idempotência
 
 O consumidor usa long polling e só exclui a mensagem depois que:
 
-1. o estado da execução, a chave de idempotência e a resposta de outbox forem
+1. o estado global, o ciclo dos serviços, a Inbox e a resposta de Outbox forem
    gravados atomicamente com `TransactWriteItems`;
 2. a resposta for enviada à fila FIFO de respostas;
 3. o outbox for marcado como publicado.
@@ -68,121 +57,53 @@ automaticamente a DLQ.
 
 ### Limitações funcionais atuais
 
-- `IniciarExecucao` persiste os serviços e peças informados e confirma que a
-  execução foi iniciada. Ainda não há worker ou operação de domínio que realize
-  o trabalho mecânico e gere `ExecucaoFinalizada` ou `ExecucaoFalhou`.
-- `CancelarExecucao` falha de forma segura, sem alterar a execução, persistir
-  inbox/outbox, publicar `ExecucaoCancelada` ou excluir a mensagem SQS. O comando
-  será redeliverado e enviado à DLQ pela política configurada. O contrato descreve
-  devolução de peças reservadas, mas o serviço não tem worker de interrupção nem
-  ownership/adapter de estoque definido; não acessa banco de dados do OS
-  Service/Billing. Habilitar o cancelamento exige alinhar e implementar essa
-  responsabilidade antes de confirmar o comando.
-- No monólito Fase 3, iniciar um item exigia status `PENDENTE`, OS em
-  `EXECUCAO`, e consumo de peças dentro das quantidades reservadas. Finalizar
-  exigia item `EM_EXECUCAO`, data final não anterior ao início, e só finalizava
-  a OS depois de todos os serviços concluídos. Essas regras ainda não foram
-  portadas para um worker de execução, pois o contrato v1 não define esse
-  ciclo operacional nem uma integração de estoque para este microsserviço.
-- O contrato não especifica a propriedade da fila compartilhada de respostas.
-  Terraform recebe seu ARN como variável e não cria uma segunda fila.
-- O schema v1 define `ExecucaoFalhou` com `orcamentoId`, `execucaoId` (nulo se
-  ainda não houver execução) e `erro` (`codigo` e `mensagem`); `ExecucaoFinalizada`
-  exige `execucaoId` e `finalizadaEm`. O contrato e o monólito não fornecem um
-  comando/evento de conclusão nem um adapter de trabalho mecânico que permita
-  produzir essas respostas com segurança. Não há transição de sucesso/falha
-  simulada.
-- O repositório `tech-challenge-oficina-saga` mantém o AsyncAPI e os schemas v1
-  em `main`. O AsyncAPI identifica a v1 como proposta para revisão do grupo;
-  a aprovação dos mantenedores continua necessária para qualquer extensão.
-- O serviço propaga `traceparent`/`tracestate` como message attributes, mas não
-  exporta spans para New Relic ou outro collector e não implementa métricas.
-  Os eventos de log são emitidos em JSON com identificadores de mensagem,
-  requisição, Saga e OS quando disponíveis.
+- `ExecutionWorkUseCase` oferece entrada de aplicação interna para iniciar e
+  finalizar serviços, mas não existe neste repositório um worker que determine
+  quando o trabalho mecânico real termina. A aplicação que executa esse trabalho
+  ainda precisa invocar essa porta.
+- O Execution persiste a compensação local e emite `ExecucaoCancelada`. A
+  liberação física das reservas continua pertencendo ao serviço dono do estoque
+  (OS Service); este repositório não acessa o banco de outro serviço.
+- Não há worker/critério operacional que gere `ExecucaoFalhou`; a execução
+  aceita esse estado persistido para processar o `CancelarExecucao` de
+  compensação conforme a Saga.
+- A fila compartilhada de respostas é fornecida por ARN e não é criada pelo
+  Terraform deste repositório.
+- O relay é pelo menos uma vez: se o envio ao SQS ocorrer e a confirmação da
+  Outbox falhar, a mesma resposta pode ser reenviada. A Outbox mantém o mesmo
+  `messageId`; a deduplicação FIFO do SQS é limitada no tempo e não substitui a
+  idempotência do consumidor.
 
-## Regras de negócio e extração
+## Ciclo interno dos serviços
 
-O monólito faz `IniciarServico` por item de serviço: exige item `PENDENTE` e OS
-em `EXECUCAO`, valida consumo positivo e não superior ao saldo reservado,
-registra o consumo e atualiza `quantidade_utilizada`. `FinalizarServico` exige
-item `EM_EXECUCAO`, data final não anterior à inicial e OS em `EXECUCAO`;
-finaliza a OS apenas quando todos os itens de serviço estão concluídos e as
-peças reservadas foram utilizadas. O repositório/Django mantém itens,
-consumos, status da OS e transações.
+`ExecutionWorkUseCase` expõe `start_service`, `record_consumption` e
+`finish_service` à camada de aplicação; não foi criada rota HTTP nem mensagem
+por serviço. A aplicação inicia o serviço e registra a data, registra em
+operação idempotente as peças e quantidades efetivamente consumidas (validando
+contra as reservas), e então registra a conclusão. Só a conclusão do último
+serviço cria `ExecucaoFinalizada`. `pecasConsumidas` é agregado por
+`itemPecaOSId` e a transição final é persistida junto com o estado, recibo
+idempotente e Outbox.
 
-O contrato `IniciarExecucao` só carrega IDs/quantidades de serviços e peças
-aprovados; não carrega IDs de itens da OS, estado/reserva atual, datas por
-serviço, nem operação de estoque. `CancelarExecucao` exige o ID da execução e
-um motivo, e descreve a compensação como devolver peças reservadas, mas o código
-de execução do monólito não define um caso de uso de cancelamento independente
-nem ownership de estoque para o novo serviço. Por isso, essas operações
-originais não foram copiadas para o DynamoDB nem substituídas por sucesso
-simulado; concluir o ciclo requer definir o adapter/ownership e o comando de
-trabalho mecânico.
+O agregado dos serviços é criado atomicamente com `IniciarExecucao`,
+`ExecucaoIniciada`, Inbox e Outbox. DynamoDB usa transações e controle otimista
+de versão para serializar atualizações concorrentes; a aplicação repete a
+finalização quando outro serviço vence primeiro a disputa.
 
-### Bloqueio para o ciclo individual dos serviços
+`CancelarExecucao` registra o motivo, cancela serviços não concluídos e persiste
+`ExecucaoCancelada` na mesma transação que a Inbox/Outbox. Também aceita uma
+execução no estado `FALHOU`. O contrato de resposta contém somente `execucaoId`;
+a liberação das reservas é responsabilidade do OS Service, proprietário dessa
+compensação, e não é simulada por acesso ao banco de outro serviço.
 
-O contrato v1 disponível não permite iniciar/finalizar serviços individualmente
-nem fazer a validação de consumo antes de mudar um serviço para
-`EM_EXECUCAO`. A fila de comandos define `IniciarExecucao` e `CancelarExecucao`;
-as respostas incluem `ExecucaoIniciada`, `ExecucaoFinalizada`,
-`ExecucaoFalhou` e `ExecucaoCancelada`. Não existem comandos de início/fim por
-serviço, retorno de aceite/rejeição do OS Service ou mensagem de consumo por
-serviço. `ExecucaoFinalizada` só contém `execucaoId` e `finalizadaEm`.
-
-No modelo atual do OS Service, `servicoId` é numérico e único por OS pela
-restrição `(ordem_servico, servico)`, portanto `(osId, servicoId)` identifica o
-serviço enquanto essa invariável for mantida. Para peças, `pecaId` não
-identifica necessariamente uma reserva específica: a OS pode ter linhas
-`ItemPecaOS` distintas para a mesma peça, e o consumo legado relaciona essas
-linhas a um item de serviço. O contrato v1 não inclui o identificador da linha
-reservada.
-
-Por isso, o Execution Service não pode implementar com segurança, usando apenas
-o contrato atual, a sequência “registrar consumo → aguardar validação/aceite do
-OS → marcar serviço `EM_EXECUCAO`”, nem comunicar o consumo por linha da OS. A
-tentativa pendente também não pode ser descartada quando houver incerteza sobre
-se a validação ou o consumo foram aplicados. Não se deve reutilizar ou ampliar
-unilateralmente `IniciarExecucao`, `ExecucaoFinalizada` ou outros tipos v1 para
-representar essas operações.
-
-O fluxo permanece bloqueado até OS/Saga aprovarem e publicarem os contratos
-necessários para: (1) comandos de início e fim por serviço; (2) solicitação e
-resposta de aceite/rejeição do consumo pelo OS Service, incluindo correlação
-idempotente; e (3) comunicação do consumo com referência suficiente para a OS
-identificar suas reservas. A conclusão no wire deve preservar
-`ExecucaoFinalizada`; `EXECUTION_COMPLETED` é somente o evento interno de
-domínio, não um segundo tipo de mensagem. Depois desse alinhamento, será
-possível implementar a transição pendente de forma retomável, a Outbox com
-todas as saídas atômicas e os respectivos handlers/testes, sem acesso ao banco
-de outro microsserviço.
-
-#### Núcleo de domínio local
-
-`execution_service/domain/service_execution.py` contém a máquina de estados
-local por serviço (`PENDENTE`, `INICIO_PENDENTE`, `EM_EXECUCAO` e `CONCLUIDO`),
-validação positiva das quantidades e IDs de reserva (`itemPecaOSId` + `pecaId`),
-confirmação explícita do início **e do consumo**, rejeição explícita e
-idempotência da tentativa corrente por UUID de mensagem. O chamador só deve
-aplicar confirmação/rejeição após validar e persistir a decisão correlacionada
-da Saga/OS; a entidade não verifica nem simula essa integração. Timeout ou
-falha não têm transição que limpe `INICIO_PENDENTE`.
-`ExecutionLifecycle` agrega os serviços por OS e produz o evento de domínio
-`EXECUTION_COMPLETED` uma única vez quando todos estão concluídos.
-
-Essas entidades ainda **não estão ligadas** ao consumer, aos Use Cases
-operacionais, ao repositório DynamoDB ou à Outbox. Não gravam confirmação ou
-rejeição da Saga, não enviam consumo ao OS e não publicam `ExecucaoFinalizada`.
-Assim, não há integração simulada nem alegação de fluxo ponta a ponta. O
-próximo passo depende da aprovação dos contratos compartilhados de início/fim,
-consumo e aceite/rejeição; `itemPecaOSId` deve ser aprovado antes de sair em
-mensagens. O domínio mantém somente a tentativa corrente: redeliveries de
-mensagens de tentativas antigas, após novas tentativas e rejeições subsequentes,
-devem ser deduplicadas pelo histórico durável do repositório antes de chamar a
-entidade. A presença do evento em memória não garante publicação única após
-reinício; o futuro repositório deve persistir a transição final e a mensagem
-`ExecucaoFinalizada` na Outbox na mesma transação, com condição/idempotência
-durável. Os testes locais cobrem apenas as regras puras do domínio.
+O `ExecutionWorkUseCase` é a entrada interna que um futuro worker de trabalho
+mecânico deve chamar. Hoje não há nesse repositório um worker que determine o
+progresso físico dos serviços; testes integrados acionam a entrada de aplicação
+diretamente, sem alegar essa integração inexistente. A referência consultada no
+[Billing Service](https://github.com/helyomendesdev/tech-challenge-oficina-billing)
+usa uma Unit of Work transacional para estado, Inbox e Outbox e um relay de
+eventos pendentes; o Execution mantém essas gravações atômicas em
+`TransactWriteItems` e usa seu relay FIFO recuperável.
 
 ## Estrutura de testes e versionamento de dados
 
@@ -211,8 +132,9 @@ pytest
 
 O processo de produção requer as variáveis em `.env.example` no ambiente. O
 arquivo `.env` não é carregado automaticamente. Boto3 usa a cadeia padrão de
-credenciais AWS (por exemplo, role do workload); não configure segredos no
-código nem versionamento.
+credenciais AWS: credenciais temporárias em `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN` têm suporte, assim como profiles
+locais e roles de workload. Não configure segredos no código nem os versione.
 
 ```powershell
 $env:AWS_REGION = "REGIAO_CONFIGURADA"
@@ -222,12 +144,56 @@ $env:EXECUTION_DYNAMODB_TABLE = "TABELA_CONFIGURADA"
 python -m execution_service.app
 ```
 
+### AWS Academy Learner Lab
+
+1. Inicie o Learner Lab e, em **AWS Details**, copie as credenciais temporárias
+   da opção **AWS CLI** para variáveis de ambiente na sessão local do terminal:
+   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN`. Não as
+   grave em `.env`, `.tfvars`, no Dockerfile ou no repositório. Elas expiram;
+   obtenha um novo conjunto no Learner Lab e atualize as variáveis da sessão
+   antes de continuar.
+   No PowerShell, os prompts abaixo leem cada valor sem exibi-lo:
+
+   ```powershell
+   $env:AWS_ACCESS_KEY_ID = [Net.NetworkCredential]::new("", (Read-Host -Prompt "AWS_ACCESS_KEY_ID" -AsSecureString)).Password
+   $env:AWS_SECRET_ACCESS_KEY = [Net.NetworkCredential]::new("", (Read-Host -Prompt "AWS_SECRET_ACCESS_KEY" -AsSecureString)).Password
+   $env:AWS_SESSION_TOKEN = [Net.NetworkCredential]::new("", (Read-Host -Prompt "AWS_SESSION_TOKEN" -AsSecureString)).Password
+   $env:AWS_REGION = "REGIAO_CONFIGURADA"
+   ```
+2. Configure `AWS_REGION`, os URLs das filas e o nome da tabela como no exemplo
+   acima. Para conferir a identidade e validade sem expor chaves, execute
+   `aws sts get-caller-identity`.
+3. Use o Terraform com backend local e desative a criação da policy IAM:
+   `terraform -chdir=infra init -backend=false`, depois configure as variáveis
+   `TF_VAR_aws_region`, `TF_VAR_execution_dynamodb_table_name` e
+   `TF_VAR_saga_responses_queue_arn`, e execute
+   `terraform -chdir=infra plan -var="create_runtime_policy=false"`.
+   Aplique apenas após revisar o plano e confirmar permissões/custos da conta.
+   O backend S3 requer bucket existente e acesso S3; para o Learner Lab,
+   backend local evita essa dependência.
+4. No terminal com credenciais válidas e as variáveis de runtime configuradas,
+   execute `python -m execution_service.app`. Para Docker, veja o exemplo
+   abaixo, que passa também as três variáveis temporárias ao container; o SDK
+   mantém a mesma cadeia padrão.
+
+O Terraform cria filas SQS e tabela/índice DynamoDB, mas pode não ter permissão
+para provisionar todos esses recursos no Learner Lab. Em runtime, o principal
+fornecido pela conta precisa autorizar `sqs:ReceiveMessage`,
+`sqs:DeleteMessage`, `sqs:SendMessage`, `dynamodb:GetItem`,
+`dynamodb:TransactWriteItems`, `dynamodb:UpdateItem` e `dynamodb:Query` no
+índice da Outbox. Se o Learner Lab negar alguma ação, use recursos já
+provisionados e permitidos ou execute em uma conta com as permissões necessárias;
+não há bypass no serviço.
+
 ## Docker
 
 ```powershell
 docker build -t execution-service .
 docker run --rm `
   -e AWS_REGION `
+  -e AWS_ACCESS_KEY_ID `
+  -e AWS_SECRET_ACCESS_KEY `
+  -e AWS_SESSION_TOKEN `
   -e EXECUTION_COMMANDS_QUEUE_URL `
   -e SAGA_RESPONSES_QUEUE_URL `
   -e EXECUTION_DYNAMODB_TABLE `
@@ -238,8 +204,10 @@ docker run --rm `
 
 O módulo em `infra/` contém as filas de comando e DLQ conforme o contrato, a
 tabela DynamoDB para estado/inbox/outbox e seu índice de pendências, e uma
-policy IAM de runtime com permissões limitadas a esses recursos e à fila de
-respostas fornecida por ARN.
+policy IAM de runtime opcional com permissões limitadas a esses recursos e à
+fila de respostas fornecida por ARN. Para o Learner Lab, desative a criação
+com `create_runtime_policy=false`; para a conta convencional, o padrão cria a
+policy para anexar à identidade de workload já existente.
 O bucket S3 do backend precisa ser criado previamente; veja
 [`infra/README.md`](infra/README.md) para inicialização e variáveis.
 
@@ -256,43 +224,10 @@ O namespace e o ServiceAccount ligado à identidade AWS devem ser fornecidos
 pela infraestrutura compartilhada; este repositório não cria cluster, ECR,
 namespace, IAM role ou ServiceAccount. O deploy só renderiza ConfigMap e
 Deployment do worker. Não execute `terraform apply` nem habilite CD antes do
-alinhamento do `MessageGroupId`, da criação dos recursos compartilhados e da
-confirmação da integração de execução mecânica.
+provisionamento dos recursos compartilhados e da integração do worker de
+execução mecânica com `ExecutionWorkUseCase`.
 
-## Use Cases locais para serviços
-
-`execution_service/application/service_execution_use_cases.py` contém Use Cases
-para iniciar, confirmar, rejeitar e finalizar um serviço. O `ExecuteCommandUseCase`
-existente continua responsável pelo comando global v1 `IniciarExecucao`; não foi
-duplicado nem alterado. O início individual persiste no agregado como
-`INICIO_PENDENTE`, incluindo o consumo solicitado, e só passa a
-`EM_EXECUCAO` após a porta `PersistedServiceStartDecisionPort` fornecer uma
-decisão durável, explicitamente correlacionada à OS, serviço e tentativa.
-Timeouts e resultados desconhecidos não são tratados como rejeição.
-
-Esses Use Cases ainda não estão conectados ao consumer ou à composição de
-produção. `ServiceExecutionRepositoryPort` define uma única operação atômica
-para persistir estado, recibo idempotente e eventual Outbox; somente o fake em
-memória implementa essa porta nesta etapa. O repositório DynamoDB e o relay
-existentes persistem o modelo global legado e não leem esses novos registros.
-Assim, os testes verificam o contrato atômico da porta e o comportamento dos
-Use Cases, mas não alegam persistência durável de produção para o agregado por
-serviço.
-
-Quando o último serviço termina, o Use Case mapeia o evento interno
-`EXECUTION_COMPLETED` para o formato v1 já existente `ExecucaoFinalizada` e o
-entrega à mesma fronteira de commit para gravar a Outbox junto ao estado. O
-fluxo ainda não publica essa mensagem em produção: faltam a implementação
-DynamoDB dessa porta, sua integração com o relay e um gatilho de finalização
-individual aprovado. O contrato v1 não define comandos de serviço, retorno de
-aceite/rejeição, nem mensagem de consumo; nenhuma dessas mensagens foi criada.
-Em particular, `itemPecaOSId` permanece dado local e não é enviado ao OS
-Service até aprovação do contrato compartilhado.
-
-A inicialização do agregado por serviço a partir do `IniciarExecucao` global
-também requer uma gravação transacional coordenada com o registro global e sua
-resposta `ExecucaoIniciada`; ela não é feita em duas gravações independentes.
-Até essa evolução e o alinhamento de contratos serem aprovados, os novos Use
-Cases são uma camada local de aplicação, não uma integração ponta a ponta.
-`CancelarExecucao` mantém o comportamento seguro já documentado e não foi
-alterado.
+O deploy por GitHub Actions é voltado a uma conta convencional: exige uma role
+com trust OIDC para GitHub e permissões de ECR/EKS, além da identidade do
+workload no cluster. O fluxo local com credenciais temporárias do Learner Lab
+não provisiona nem substitui essa configuração.
