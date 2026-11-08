@@ -8,11 +8,16 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
-from execution_service.application.dto import OutboxMessage
+from execution_service.application.dto import OutboxMessage, ServiceCommandReceipt
 from execution_service.application.ports import ExecutionRepositoryPort
 from execution_service.domain.enums import ExecutionStatus
-from execution_service.domain.exceptions import IdempotencyKeyReuseError
+from execution_service.domain.exceptions import (
+    ConcurrentExecutionUpdateError,
+    IdempotencyKeyReuseError,
+    TransitionNotAllowedError,
+)
 from execution_service.domain.models import ExecutionRecord
+from execution_service.domain.service_execution import ExecutionLifecycle, ServiceStatus
 
 
 class DynamoDBExecutionRepository(ExecutionRepositoryPort):
@@ -43,9 +48,10 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
         input_fingerprint: str,
         response: OutboxMessage,
         expected_version: int | None,
+        lifecycle: ExecutionLifecycle | None = None,
+        expected_lifecycle_version: int | None = None,
     ) -> bool:
         message_key = f"MSG#{input_message_id}"
-        outbox_key = f"OUTBOX#{input_message_id}"
         record_item = self._record_item(record)
         idempotency_item = {
             "pk": message_key,
@@ -54,20 +60,6 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
             "input_fingerprint": input_fingerprint,
             "saga_id": record.saga_id,
         }
-        outbox_item = {
-            "pk": outbox_key,
-            "sk": "EVENT",
-            "entity_type": "OUTBOX",
-            "schema_version": 1,
-            "outbox_status": "PENDING",
-            "outbox_created_at": datetime.now(timezone.utc).isoformat() + f"#{input_message_id}",
-            "input_message_id": input_message_id,
-            "published": False,
-            "message": response.message,
-            "message_attributes": response.message_attributes,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-
         record_condition = (
             "attribute_not_exists(pk)"
             if expected_version is None
@@ -84,26 +76,51 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                 {":expected_version": expected_version}
             )
 
-        try:
-            self.client.transact_write_items(
-                TransactItems=[
-                    {"Put": record_put},
-                    {
-                        "Put": {
-                            "TableName": self.table_name,
-                            "Item": self._serialize_item(idempotency_item),
-                            "ConditionExpression": "attribute_not_exists(pk)",
-                        }
-                    },
-                    {
-                        "Put": {
-                            "TableName": self.table_name,
-                            "Item": self._serialize_item(outbox_item),
-                            "ConditionExpression": "attribute_not_exists(pk)",
-                        }
-                    },
-                ]
+        operations: list[dict[str, Any]] = [
+            {"Put": record_put},
+            {
+                "Put": {
+                    "TableName": self.table_name,
+                    "Item": self._serialize_item(idempotency_item),
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.table_name,
+                    "Item": self._serialize_item(self._outbox_item(input_message_id, response)),
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+        ]
+        if lifecycle is not None:
+            lifecycle_condition = (
+                "attribute_not_exists(pk)"
+                if expected_lifecycle_version is None
+                else "#version = :expected_version"
             )
+            lifecycle_put: dict[str, Any] = {
+                "TableName": self.table_name,
+                "Item": self._serialize_item(
+                    self._lifecycle_item(
+                        record.saga_id,
+                        lifecycle,
+                        0 if expected_lifecycle_version is None else expected_lifecycle_version + 1,
+                    )
+                ),
+                "ConditionExpression": lifecycle_condition,
+            }
+            if expected_lifecycle_version is not None:
+                lifecycle_put["ExpressionAttributeNames"] = {"#version": "version"}
+                lifecycle_put["ExpressionAttributeValues"] = self._serialize_item(
+                    {":expected_version": expected_lifecycle_version}
+                )
+            operations.append({"Put": lifecycle_put})
+        elif expected_lifecycle_version is not None:
+            raise ValueError("expected_lifecycle_version requires a lifecycle")
+
+        try:
+            self.client.transact_write_items(TransactItems=operations)
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") not in {
                 "TransactionCanceledException",
@@ -117,7 +134,158 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                         f"messageId={input_message_id} was reused with a different body"
                     ) from exc
                 return False
-            raise
+            raise ConcurrentExecutionUpdateError(
+                "Concurrent execution state change; retry the command"
+            ) from exc
+        return True
+
+    def load_lifecycle(self, saga_id: str) -> tuple[ExecutionLifecycle, int] | None:
+        item = self._get_item(f"EXEC#{saga_id}", "LIFECYCLE")
+        if item is None:
+            return None
+        lifecycle_state = item.get("lifecycle")
+        if not isinstance(lifecycle_state, dict):
+            raise RuntimeError(f"Persisted lifecycle is invalid for sagaId={saga_id}")
+        return ExecutionLifecycle.from_state(lifecycle_state), int(item["version"])
+
+    def get_service_command_receipt(self, message_id: str) -> ServiceCommandReceipt | None:
+        item = self._get_item(f"MSG#{message_id}", "SERVICE_COMMAND")
+        if item is None:
+            return None
+        outbox = None
+        if item.get("has_outbox"):
+            outbox = self.get_outbox(message_id)
+            if outbox is None:
+                raise RuntimeError(f"Service outbox record missing for messageId={message_id}")
+        return ServiceCommandReceipt(
+            fingerprint=item["input_fingerprint"],
+            status=ServiceStatus(item["status"]),
+            outbox_message=outbox,
+        )
+
+    def commit_service_command(
+        self,
+        lifecycle: ExecutionLifecycle,
+        message_id: str,
+        fingerprint: str,
+        status: ServiceStatus,
+        outbox_message: OutboxMessage | None,
+        expected_version: int,
+    ) -> bool:
+        lifecycle_key = {"pk": f"EXEC#{lifecycle.saga_id}", "sk": "LIFECYCLE"}
+        stored_lifecycle = self._get_item(
+            lifecycle_key["pk"],
+            lifecycle_key["sk"],
+        )
+        if stored_lifecycle is None:
+            raise RuntimeError(f"Execution lifecycle missing for sagaId={lifecycle.saga_id}")
+        record = self.get_by_saga_id(lifecycle.saga_id)
+        if record is None:
+            raise RuntimeError(f"Execution record missing for sagaId={lifecycle.saga_id}")
+        if record.status is not ExecutionStatus.EM_EXECUCAO:
+            raise TransitionNotAllowedError("Execution is no longer accepting service changes")
+
+        operations: list[dict[str, Any]] = [
+            {
+                "Put": {
+                    "TableName": self.table_name,
+                    "Item": self._serialize_item(
+                        self._lifecycle_item(
+                            lifecycle.saga_id,
+                            lifecycle,
+                            expected_version + 1,
+                        )
+                    ),
+                    "ConditionExpression": "#version = :expected_version",
+                    "ExpressionAttributeNames": {"#version": "version"},
+                    "ExpressionAttributeValues": self._serialize_item(
+                        {":expected_version": expected_version}
+                    ),
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.table_name,
+                    "Item": self._serialize_item(
+                        {
+                            "pk": f"MSG#{message_id}",
+                            "sk": "SERVICE_COMMAND",
+                            "entity_type": "SERVICE_COMMAND",
+                            "input_fingerprint": fingerprint,
+                            "status": status.value,
+                            "has_outbox": outbox_message is not None,
+                        }
+                    ),
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+        ]
+
+        if outbox_message is None:
+            operations.append(
+                {
+                    "ConditionCheck": {
+                        "TableName": self.table_name,
+                        "Key": self._serialize_item(
+                            {"pk": f"EXEC#{lifecycle.saga_id}", "sk": "RECORD"}
+                        ),
+                        "ConditionExpression": "#status = :active",
+                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ExpressionAttributeValues": self._serialize_item(
+                            {":active": ExecutionStatus.EM_EXECUCAO.value}
+                        ),
+                    }
+                }
+            )
+        else:
+            record.status = ExecutionStatus.CONCLUIDA
+            record.updated_at = datetime.now(timezone.utc)
+            record.version += 1
+            operations.append(
+                {
+                    "Put": {
+                        "TableName": self.table_name,
+                        "Item": self._serialize_item(self._record_item(record)),
+                        "ConditionExpression": "#version = :expected_version AND #status = :active",
+                        "ExpressionAttributeNames": {
+                            "#version": "version",
+                            "#status": "status",
+                        },
+                        "ExpressionAttributeValues": self._serialize_item(
+                            {
+                                ":expected_version": record.version - 1,
+                                ":active": ExecutionStatus.EM_EXECUCAO.value,
+                            }
+                        ),
+                    }
+                }
+            )
+            operations.append(
+                {
+                    "Put": {
+                        "TableName": self.table_name,
+                        "Item": self._serialize_item(self._outbox_item(message_id, outbox_message)),
+                        "ConditionExpression": "attribute_not_exists(pk)",
+                    }
+                }
+            )
+
+        try:
+            self.client.transact_write_items(TransactItems=operations)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code not in {"TransactionCanceledException", "ConditionalCheckFailedException"}:
+                raise
+            receipt = self.get_service_command_receipt(message_id)
+            if receipt is not None:
+                if receipt.fingerprint != fingerprint:
+                    raise IdempotencyKeyReuseError(
+                        f"messageId={message_id} was reused with a different body"
+                    ) from exc
+                return False
+            raise ConcurrentExecutionUpdateError(
+                "Concurrent service execution state change; retry the command"
+            ) from exc
         return True
 
     def get_outbox(self, input_message_id: str) -> OutboxMessage | None:
@@ -207,6 +375,7 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
             "created_at": record.created_at.isoformat(),
             "updated_at": record.updated_at.isoformat(),
             "version": record.version,
+            "cancellation_reason": record.cancellation_reason,
         }
 
     @staticmethod
@@ -223,4 +392,36 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
             created_at=datetime.fromisoformat(item["created_at"]),
             updated_at=datetime.fromisoformat(item["updated_at"]),
             version=int(item["version"]),
+            cancellation_reason=item.get("cancellation_reason"),
         )
+
+    @staticmethod
+    def _lifecycle_item(
+        saga_id: str,
+        lifecycle: ExecutionLifecycle,
+        version: int,
+    ) -> dict[str, Any]:
+        return {
+            "pk": f"EXEC#{saga_id}",
+            "sk": "LIFECYCLE",
+            "entity_type": "EXECUTION_LIFECYCLE",
+            "version": version,
+            "lifecycle": lifecycle.to_state(),
+        }
+
+    @staticmethod
+    def _outbox_item(input_message_id: str, response: OutboxMessage) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "pk": f"OUTBOX#{input_message_id}",
+            "sk": "EVENT",
+            "entity_type": "OUTBOX",
+            "schema_version": 1,
+            "outbox_status": "PENDING",
+            "outbox_created_at": now + f"#{input_message_id}",
+            "input_message_id": input_message_id,
+            "published": False,
+            "message": response.message,
+            "message_attributes": response.message_attributes,
+            "created_at": now,
+        }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from typing import Any
 
 from execution_service.application.ports import MessagePublisherPort
@@ -26,7 +27,7 @@ class SQSFifoMessagePublisher(MessagePublisherPort):
     ) -> None:
         response = self.client.send_message(
             QueueUrl=self.queue_url,
-            MessageBody=json.dumps(message, ensure_ascii=False, separators=(",", ":")),
+            MessageBody=_dumps_message(message),
             MessageGroupId=message_group_id,
             MessageDeduplicationId=message_deduplication_id,
             MessageAttributes=message_attributes,
@@ -42,6 +43,31 @@ class SQSFifoMessagePublisher(MessagePublisherPort):
                 "sqs_message_id": response.get("MessageId"),
             },
         )
+
+
+def _dumps_message(value: Any) -> str:
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("SQS message cannot contain a non-finite Decimal")
+        if value == value.to_integral_value():
+            return str(int(value))
+        return format(value, "f")
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("SQS message object keys must be strings")
+        entries = (
+            f"{json.dumps(key, ensure_ascii=False)}:{_dumps_message(item)}"
+            for key, item in value.items()
+        )
+        return "{" + ",".join(entries) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_dumps_message(item) for item in value) + "]"
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 class FakeMessagePublisher(MessagePublisherPort):
