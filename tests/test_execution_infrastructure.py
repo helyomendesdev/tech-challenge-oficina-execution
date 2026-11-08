@@ -4,13 +4,21 @@ import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
-from execution_service.domain.exceptions import IdempotencyKeyReuseError
+from execution_service.application.service_execution_use_cases import ExecutionWorkUseCase
+from execution_service.application.use_cases import ExecuteCommandUseCase
+from execution_service.domain.exceptions import (
+    ConcurrentExecutionUpdateError,
+    IdempotencyKeyReuseError,
+)
+from execution_service.domain.service_execution import PartConsumption
 from execution_service.infrastructure.dynamodb_repository import (
     DynamoDBExecutionRepository,
 )
@@ -22,8 +30,10 @@ from execution_service.infrastructure.sqs_adapter import (
     FakeMessagePublisher,
     SQSFifoMessagePublisher,
 )
+from execution_service.interfaces.sqs_consumer import SQSFifoConsumer
 from execution_service.logging_config import JsonLogFormatter
 from tests.factories import (
+    TRACE_ATTRIBUTES,
     cancel_message,
     execution_record,
     outbox_message,
@@ -110,7 +120,7 @@ def test_invalid_message_is_not_deleted_and_is_left_for_sqs_redrive(
     assert sqs.deleted == []
 
 
-def test_unsupported_cancellation_is_not_persisted_or_acknowledged(
+def test_cancellation_is_persisted_and_acknowledged(
     consumer_factory,
 ):
     start = start_message()
@@ -128,13 +138,14 @@ def test_unsupported_cancellation_is_not_persisted_or_acknowledged(
     )
     sqs.message = sqs_message(cancellation)
 
-    assert consumer.poll_once() == 0
+    assert consumer.poll_once() == 1
 
-    assert len(sqs.deleted) == 1
+    assert len(sqs.deleted) == 2
 
-    assert repository.get_by_saga_id(start["sagaId"]).status.value == "EM_EXECUCAO"
+    assert repository.get_by_saga_id(start["sagaId"]).status.value == "CANCELADA"
 
-    assert repository.get_input_fingerprint(cancellation["messageId"]) is None
+    assert repository.get_input_fingerprint(cancellation["messageId"]) is not None
+    assert repository.get_outbox(cancellation["messageId"]).message["type"] == "ExecucaoCancelada"
 
 
 def test_outbox_relay_recovers_pending_response_after_publish_failure(
@@ -221,6 +232,112 @@ def test_outbox_confirmation_failure_retries_with_same_response_id():
         == publisher.attempts[1]["message_deduplication_id"]
     )
     assert repository.get_outbox(input_id).published is True
+
+
+def test_sqs_publisher_serializes_integral_and_fractional_decimals_recursively():
+    class SQS:
+        def send_message(self, **kwargs):
+            self.kwargs = kwargs
+            return {"MessageId": "sent"}
+
+    client = SQS()
+    publisher = SQSFifoMessagePublisher(client, "responses")
+    message = {
+        "osId": Decimal("42"),
+        "version": Decimal("1.0"),
+        "messageId": "message-1",
+        "type": "ExecucaoIniciada",
+        "sagaId": "saga-1",
+        "requestId": "request-1",
+        "payload": {
+            "quantidade": Decimal("1.250"),
+            "nested": [Decimal("0.1"), {"precisao": Decimal("12345678901234567890.123456789")}],
+        },
+    }
+
+    publisher.publish(
+        message,
+        message_group_id="saga-1",
+        message_deduplication_id="message-1",
+        message_attributes={},
+    )
+
+    assert client.kwargs["MessageBody"] == (
+        '{"osId":42,"version":1,"messageId":"message-1",'
+        '"type":"ExecucaoIniciada","sagaId":"saga-1","requestId":"request-1",'
+        '"payload":{"quantidade":1.250,'
+        '"nested":[0.1,{"precisao":12345678901234567890.123456789}]}}'
+    )
+    decoded = json.loads(client.kwargs["MessageBody"])
+    assert decoded == {
+        "osId": 42,
+        "version": 1,
+        "messageId": "message-1",
+        "type": "ExecucaoIniciada",
+        "sagaId": "saga-1",
+        "requestId": "request-1",
+        "payload": {
+            "quantidade": 1.25,
+            "nested": [0.1, {"precisao": 12345678901234567890.123456789}],
+        },
+    }
+
+
+def test_sqs_publisher_rejects_non_finite_decimal_values():
+    class SQS:
+        def send_message(self, **kwargs):
+            raise AssertionError(f"send_message should not be called: {kwargs}")
+
+    publisher = SQSFifoMessagePublisher(SQS(), "responses")
+
+    with pytest.raises(ValueError, match="non-finite"):
+        publisher.publish(
+            {
+                "messageId": "message-1",
+                "type": "ExecucaoIniciada",
+                "sagaId": "saga-1",
+                "osId": Decimal("NaN"),
+                "requestId": "request-1",
+            },
+            message_group_id="saga-1",
+            message_deduplication_id="message-1",
+            message_attributes={},
+        )
+
+
+def test_relay_publishes_execucao_iniciada_loaded_from_dynamodb_decimals():
+    repository = DynamoDBExecutionRepository(
+        "execution-table",
+        FakeDynamoDBClient(),
+    )
+    record = execution_record()
+    response = outbox_message()
+    input_id = response.message["causationId"]
+    repository.register_command(
+        record,
+        input_id,
+        "body-fingerprint",
+        response,
+        None,
+    )
+
+    class SQS:
+        def send_message(self, **kwargs):
+            self.kwargs = kwargs
+            return {"MessageId": "published"}
+
+    client = SQS()
+    relay = OutboxRelay(
+        repository,
+        SQSFifoMessagePublisher(client, "responses"),
+    )
+
+    assert relay.poll_once() == 1
+    published = json.loads(client.kwargs["MessageBody"])
+    assert published["type"] == "ExecucaoIniciada"
+    assert published["osId"] == record.os_id
+    assert published["version"] == 1
+    assert repository.get_outbox(input_id).published
 
 
 def test_persistence_failure_prevents_input_acknowledgement(
@@ -347,23 +464,33 @@ class FakeDynamoDBClient:
             decoded = []
 
             for operation in TransactItems:
-                put = operation["Put"]
-                item = self._decode(put["Item"])
-                key = (item["pk"], item["sk"])
-                old = self.items.get(key)
-                condition = put["ConditionExpression"]
+                if "Put" in operation:
+                    put = operation["Put"]
+                    item = self._decode(put["Item"])
+                    key = (item["pk"], item["sk"])
+                    old = self.items.get(key)
+                    condition = put["ConditionExpression"]
+                    names = put.get("ExpressionAttributeNames", {})
+                    values = self._decode(put.get("ExpressionAttributeValues", {}))
 
-                if condition == "attribute_not_exists(pk)" and old is not None:
-                    self._transaction_cancelled()
-
-                if condition == "#version = :expected_version":
-                    names = put["ExpressionAttributeNames"]
-                    values = self._decode(put["ExpressionAttributeValues"])
-
-                    if old is None or old[names["#version"]] != values[":expected_version"]:
+                    if condition == "attribute_not_exists(pk)" and old is not None:
                         self._transaction_cancelled()
-
-                decoded.append((key, item))
+                    if "#version = :expected_version" in condition:
+                        if old is None or old.get(names["#version"]) != values[":expected_version"]:
+                            self._transaction_cancelled()
+                    if "#status = :active" in condition:
+                        if old is None or old.get(names["#status"]) != values[":active"]:
+                            self._transaction_cancelled()
+                    decoded.append((key, item))
+                else:
+                    check = operation["ConditionCheck"]
+                    key_item = self._decode(check["Key"])
+                    key = (key_item["pk"], key_item["sk"])
+                    old = self.items.get(key)
+                    names = check["ExpressionAttributeNames"]
+                    values = self._decode(check["ExpressionAttributeValues"])
+                    if old is None or old.get(names["#status"]) != values[":active"]:
+                        self._transaction_cancelled()
 
             for key, item in decoded:
                 self.items[key] = item
@@ -420,6 +547,107 @@ class FakeDynamoDBClient:
             },
             "TransactWriteItems",
         )
+
+
+def test_dynamodb_backed_integrated_start_work_completion_and_relay():
+    dynamodb = FakeDynamoDBClient()
+    repository = DynamoDBExecutionRepository("execution-table", dynamodb)
+    command = start_message()
+    command["payload"]["servicos"] = [
+        {"servicoId": 101, "quantidade": 1},
+        {"servicoId": 102, "quantidade": 1},
+    ]
+    command["payload"]["pecas"] = [
+        {"itemPecaOSId": 501, "pecaId": 10, "quantidade": 3},
+    ]
+    incoming = sqs_message(command)
+    incoming["MessageAttributes"] = TRACE_ATTRIBUTES
+    consumer_client = FakeSQSClient(incoming)
+    consumer = SQSFifoConsumer(
+        consumer_client,
+        "commands",
+        ExecuteCommandUseCase(repository),
+    )
+
+    assert consumer.poll_once() == 1
+    execution = repository.get_by_saga_id(command["sagaId"])
+    assert execution is not None
+    start_outbox = repository.get_outbox(command["messageId"])
+    assert start_outbox is not None
+    assert start_outbox.message["type"] == "ExecucaoIniciada"
+    assert repository.get_input_fingerprint(command["messageId"]) is not None
+    assert repository.load_lifecycle(command["sagaId"])[1] == 0
+
+    work = ExecutionWorkUseCase(repository)
+    started_at = execution.started_at + timedelta(minutes=1)
+    work.start_service(
+        command["sagaId"],
+        101,
+        started_at=started_at,
+    )
+    work.record_consumption(
+        command["sagaId"],
+        101,
+        (PartConsumption(501, 10, 2),),
+    )
+    work.start_service(
+        command["sagaId"],
+        102,
+        started_at=started_at,
+    )
+    work.record_consumption(
+        command["sagaId"],
+        102,
+        (PartConsumption(501, 10, 1),),
+    )
+    work.finish_service(
+        command["sagaId"],
+        101,
+        completed_at=started_at + timedelta(hours=1),
+    )
+    final = work.finish_service(
+        command["sagaId"],
+        102,
+        completed_at=started_at + timedelta(hours=2),
+    )
+    assert final.outbox_message is not None
+
+    class SQS:
+        def __init__(self):
+            self.messages = []
+
+        def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+            return {"MessageId": f"sqs-{len(self.messages)}"}
+
+    sqs = SQS()
+    relay = OutboxRelay(
+        repository,
+        SQSFifoMessagePublisher(sqs, "responses.fifo"),
+    )
+    assert relay.poll_once() == 2
+    decoded_messages = [json.loads(item["MessageBody"]) for item in sqs.messages]
+    started = next(item for item in decoded_messages if item["type"] == "ExecucaoIniciada")
+    finished = next(item for item in decoded_messages if item["type"] == "ExecucaoFinalizada")
+    assert started["osId"] == command["osId"]
+    assert finished["payload"]["pecasConsumidas"] == [
+        {"itemPecaOSId": 501, "pecaId": 10, "quantidade": 3}
+    ]
+    assert len([item for item in decoded_messages if item["type"] == "ExecucaoFinalizada"]) == 1
+    assert all(
+        item["MessageGroupId"] == command["sagaId"]
+        and item["MessageDeduplicationId"] == decoded["messageId"]
+        for item, decoded in zip(sqs.messages, decoded_messages)
+    )
+    assert all(
+        item["MessageAttributes"]["traceparent"]["DataType"] == "String" for item in sqs.messages
+    )
+    assert all(
+        item["MessageAttributes"]["tracestate"]["StringValue"]
+        == TRACE_ATTRIBUTES["tracestate"]["StringValue"]
+        for item in sqs.messages
+    )
+    assert repository.get_by_saga_id(command["sagaId"]).status.value == "CONCLUIDA"
 
 
 def test_dynamodb_repository_atomically_persists_execution_inbox_and_outbox():
@@ -563,7 +791,7 @@ def test_dynamodb_repository_enforces_atomic_create_and_idempotency_key():
         None,
     )
 
-    with pytest.raises(ClientError):
+    with pytest.raises(ConcurrentExecutionUpdateError):
         repository.register_command(
             execution_record(record.saga_id),
             str(uuid4()),

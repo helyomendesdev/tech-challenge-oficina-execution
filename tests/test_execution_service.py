@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock, call
 from uuid import uuid4
 
+import boto3
 import pytest
 
+from execution_service.app import create_aws_clients
 from execution_service.application.use_cases import ExecutionMessageValidator
 from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.exceptions import (
-    ExecutionCancellationUnavailableError,
     IdempotencyKeyReuseError,
     MessageValidationError,
     TransitionNotAllowedError,
@@ -24,6 +26,35 @@ from tests.factories import (
     cancel_message,
     start_message,
 )
+
+
+def test_aws_client_factory_uses_boto3_session_and_configured_region(monkeypatch):
+    session = Mock()
+    session.client.side_effect = ["sqs-client", "dynamodb-client"]
+    session_factory = Mock(return_value=session)
+    monkeypatch.setattr("execution_service.app.boto3.Session", session_factory)
+
+    clients = create_aws_clients("us-west-2")
+
+    assert clients == ("sqs-client", "dynamodb-client")
+    session_factory.assert_called_once_with(region_name="us-west-2")
+    session.client.assert_has_calls([call("sqs"), call("dynamodb")])
+
+
+def test_boto3_default_chain_accepts_aws_academy_session_credentials(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "temporary-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "temporary-secret-key")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "temporary-session-token")
+
+    session = boto3.Session(region_name="us-west-2")
+    credentials = session.get_credentials()
+
+    assert credentials is not None
+    assert credentials.method == "env"
+    frozen_credentials = credentials.get_frozen_credentials()
+    assert frozen_credentials.access_key == "temporary-access-key"
+    assert frozen_credentials.secret_key == "temporary-secret-key"
+    assert frozen_credentials.token == "temporary-session-token"
 
 
 def test_execution_policy_rejects_second_start():
@@ -90,7 +121,7 @@ def test_application_composition_accepts_test_repository(
     assert pending.published is False
 
 
-def test_cancel_command_is_not_confirmed_without_stock_compensation_owner(
+def test_cancel_command_is_persisted_and_acknowledged_with_contract_response(
     processor_factory,
 ):
     repository = InMemoryExecutionRepository()
@@ -104,16 +135,33 @@ def test_cancel_command_is_not_confirmed_without_stock_compensation_owner(
         started.execution_id,
     )
 
-    with pytest.raises(ExecutionCancellationUnavailableError):
-        use_case.handle(cancellation)
+    result = use_case.handle(cancellation)
 
     saved = repository.get_by_saga_id(start["sagaId"])
 
-    assert saved.status == ExecutionStatus.EM_EXECUCAO
+    assert result.message_type == "ExecucaoCancelada"
+    assert saved.status == ExecutionStatus.CANCELADA
     assert started.execution_id == saved.execution_id
 
     assert repository.get_outbox(start["messageId"]) is not None
-    assert repository.get_input_fingerprint(cancellation["messageId"]) is None
+    pending = repository.get_outbox(cancellation["messageId"])
+    assert pending.message["type"] == "ExecucaoCancelada"
+    assert pending.message["payload"] == {"execucaoId": saved.execution_id}
+
+
+def test_cancel_command_is_supported_after_execution_failure(processor_factory):
+    repository = InMemoryExecutionRepository()
+    processor = processor_factory(repository)
+    start = start_message()
+    started = processor.handle(start)
+    repository.records[start["sagaId"]].status = ExecutionStatus.FALHOU
+    cancellation = cancel_message(start, started.execution_id)
+    cancellation["payload"]["motivo"] = "EXECUCAO_FALHOU"
+
+    result = processor.handle(cancellation)
+
+    assert result.message_type == "ExecucaoCancelada"
+    assert repository.get_by_saga_id(start["sagaId"]).status is ExecutionStatus.CANCELADA
 
 
 def test_duplicate_redelivery_reuses_persisted_outbox(
@@ -213,6 +261,15 @@ def test_failure_to_persist_does_not_create_idempotency_or_outbox(
                 "orcamentoId": str(uuid4()),
                 "servicos": [{"servicoId": 0, "quantidade": 1}],
                 "pecas": [],
+            }
+        },
+        {
+            "payload": {
+                "orcamentoId": str(uuid4()),
+                "servicos": [{"servicoId": 1, "quantidade": 1}],
+                "pecas": [
+                    {"itemPecaOSId": 0, "pecaId": 9, "quantidade": 1},
+                ],
             }
         },
     ],

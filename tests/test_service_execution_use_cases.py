@@ -1,485 +1,339 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Barrier, Lock
 from uuid import uuid4
 
 import pytest
 
-from execution_service.application.dto import (
-    PersistedServiceStartDecision,
-    ServiceExecutionCommandContext,
-)
-from execution_service.application.service_execution_use_cases import (
-    ConfirmServiceStartUseCase,
-    FinishServiceUseCase,
-    RejectServiceStartUseCase,
-    StartServiceUseCase,
-)
+from execution_service.application.service_execution_use_cases import ExecutionWorkUseCase
+from execution_service.application.use_cases import ExecuteCommandUseCase
+from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.exceptions import (
     IdempotencyKeyReuseError,
     MessageValidationError,
     TransitionNotAllowedError,
 )
-from execution_service.domain.service_execution import (
-    ExecutionLifecycle,
-    PartConsumption,
-    ServiceStatus,
-)
-from execution_service.infrastructure.fake_service_execution_repository import (
-    InMemoryServiceExecutionRepository,
-)
+from execution_service.domain.service_execution import PartConsumption, ServiceStatus
+from execution_service.infrastructure.fake_repository import InMemoryExecutionRepository
+from tests.factories import TRACE_ATTRIBUTES, start_message
 
-OS_ID = 42
-SERVICE_IDS = (101, 102)
-STARTED_AT = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-
-
-class PersistedDecisionFake:
-    def __init__(self) -> None:
-        self.decisions: dict[str, PersistedServiceStartDecision] = {}
-        self.calls = 0
-        self.unavailable = False
-
-    def get_persisted_decision(self, decision_message_id: str):
-        self.calls += 1
-        if self.unavailable:
-            raise RuntimeError("decision store unavailable")
-        return self.decisions.get(decision_message_id)
-
-    def add(
-        self,
-        context: ServiceExecutionCommandContext,
-        service_id: int,
-        start_message_id: str,
-        outcome: str,
-    ) -> None:
-        self.decisions[context.message_id] = PersistedServiceStartDecision(
-            saga_id=context.saga_id,
-            os_id=context.os_id,
-            service_id=service_id,
-            start_message_id=start_message_id,
-            decision_message_id=context.message_id,
-            outcome=outcome,
-        )
+STARTED_AT = datetime(2026, 11, 1, 10, tzinfo=timezone.utc)
+RESERVED_PARTS = [
+    {"itemPecaOSId": 501, "pecaId": 10, "quantidade": 5},
+    {"itemPecaOSId": 502, "pecaId": 11, "quantidade": 2},
+]
 
 
 @pytest.fixture
-def lifecycle():
-    return ExecutionLifecycle(
-        os_id=OS_ID,
-        saga_id=str(uuid4()),
-        execution_id=str(uuid4()),
-        service_ids=SERVICE_IDS,
-    )
+def execution():
+    repository = InMemoryExecutionRepository()
+    command = start_message()
+    command["payload"]["servicos"] = [
+        {"servicoId": 101, "quantidade": 1},
+        {"servicoId": 102, "quantidade": 1},
+    ]
+    command["payload"]["pecas"] = RESERVED_PARTS
+    result = ExecuteCommandUseCase(repository).handle(command, TRACE_ATTRIBUTES)
+    return repository, command, result, ExecutionWorkUseCase(repository)
 
 
-@pytest.fixture
-def repository(lifecycle):
-    repo = InMemoryServiceExecutionRepository()
-    repo.add_lifecycle(lifecycle)
-    return repo
+def test_internal_start_and_consumption_are_recorded_separately(execution):
+    repository, command, _result, work = execution
+    message_id = str(uuid4())
+    consumed = (PartConsumption(501, 10, 2),)
 
-
-def context(lifecycle, message_id: str | None = None):
-    return ServiceExecutionCommandContext(
-        saga_id=lifecycle.saga_id,
-        execution_id=lifecycle.execution_id,
-        os_id=lifecycle.os_id,
-        message_id=message_id or str(uuid4()),
-        request_id="request-1",
-    )
-
-
-def start_service(repository, lifecycle, service_id, message_id=None):
-    command = context(lifecycle, message_id)
-    result = StartServiceUseCase(repository).execute(
-        context=command,
-        service_id=service_id,
+    result = work.start_service(
+        command["sagaId"],
+        101,
         started_at=STARTED_AT,
-        parts=(PartConsumption(item_peca_os_id=1, peca_id=10, quantity=2),),
-    )
-    return command, result
-
-
-def resolve_service(
-    repository,
-    decisions,
-    lifecycle,
-    service_id,
-    start_message_id,
-    outcome,
-    message_id=None,
-):
-    command = context(lifecycle, message_id)
-    decisions.add(command, service_id, start_message_id, outcome)
-    use_case = (
-        ConfirmServiceStartUseCase(repository, decisions)
-        if outcome == "ACCEPTED"
-        else RejectServiceStartUseCase(repository, decisions)
-    )
-    return command, use_case.execute(command, service_id, start_message_id)
-
-
-def test_start_service_persists_pending_state_and_part_consumption(repository, lifecycle):
-    command, result = start_service(repository, lifecycle, SERVICE_IDS[0])
-
-    assert result.status is ServiceStatus.INICIO_PENDENTE
-    assert result.outbox_message is None
-    persisted, version = repository.load_lifecycle(lifecycle.saga_id)
-    service = persisted.service(SERVICE_IDS[0])
-    assert service.pending_started_at == STARTED_AT
-    assert service.pending_parts == (PartConsumption(1, 10, 2),)
-    assert version == 1
-    assert repository.get_service_command_receipt(command.message_id) is not None
-
-
-def test_start_service_is_idempotent_and_rejects_key_reuse(repository, lifecycle):
-    command, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    duplicate = StartServiceUseCase(repository).execute(
-        command,
-        SERVICE_IDS[0],
-        STARTED_AT,
-        (PartConsumption(1, 10, 2),),
+        message_id=message_id,
     )
 
-    assert duplicate.duplicate
-    assert repository.load_lifecycle(lifecycle.saga_id)[1] == 1
-
-    with pytest.raises(IdempotencyKeyReuseError):
-        StartServiceUseCase(repository).execute(
-            command,
-            SERVICE_IDS[0],
-            STARTED_AT,
-            (PartConsumption(1, 10, 3),),
-        )
-
-
-def test_service_start_rejects_non_pending_transition(repository, lifecycle):
-    command, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    _, _ = resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        command.message_id,
-        "ACCEPTED",
-    )
-
-    with pytest.raises(TransitionNotAllowedError):
-        StartServiceUseCase(repository).execute(
-            context(lifecycle),
-            SERVICE_IDS[0],
-            STARTED_AT,
-            (PartConsumption(item_peca_os_id=1, peca_id=10, quantity=1),),
-        )
-
-
-def test_start_service_rejects_invalid_identifiers_and_quantities(repository, lifecycle):
-    with pytest.raises(MessageValidationError):
-        invalid_context = ServiceExecutionCommandContext(
-            saga_id=lifecycle.saga_id,
-            execution_id=lifecycle.execution_id,
-            os_id=OS_ID,
-            message_id="not-a-uuid",
-            request_id="request-1",
-        )
-        StartServiceUseCase(repository).execute(
-            invalid_context,
-            SERVICE_IDS[0],
-            STARTED_AT,
-            (),
-        )
-
-    with pytest.raises(MessageValidationError):
-        StartServiceUseCase(repository).execute(
-            context(lifecycle),
-            True,
-            STARTED_AT,
-            (),
-        )
-
-    with pytest.raises(MessageValidationError):
-        PartConsumption(item_peca_os_id=1, peca_id=10, quantity=0)
-
-    with pytest.raises(MessageValidationError, match="timezone-aware"):
-        StartServiceUseCase(repository).execute(
-            context(lifecycle),
-            SERVICE_IDS[0],
-            datetime(2026, 1, 1),
-            (),
-        )
-
-
-def test_confirm_requires_correlated_persisted_decision(repository, lifecycle):
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decision_context = context(lifecycle)
-    decisions = PersistedDecisionFake()
-    use_case = ConfirmServiceStartUseCase(repository, decisions)
-
-    with pytest.raises(TransitionNotAllowedError, match="persisted"):
-        use_case.execute(decision_context, SERVICE_IDS[0], start_context.message_id)
-    persisted, version = repository.load_lifecycle(lifecycle.saga_id)
-    assert persisted.service(SERVICE_IDS[0]).status is ServiceStatus.INICIO_PENDENTE
-    assert repository.get_service_command_receipt(decision_context.message_id) is None
-    assert version == 1
-
-    decisions.add(
-        decision_context,
-        SERVICE_IDS[1],
-        start_context.message_id,
-        "ACCEPTED",
-    )
-    with pytest.raises(MessageValidationError, match="does not match"):
-        use_case.execute(decision_context, SERVICE_IDS[0], start_context.message_id)
-
-
-def test_confirm_redelivery_uses_receipt_when_decision_store_is_unavailable(
-    repository,
-    lifecycle,
-):
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    decision_context, first_result = resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        start_context.message_id,
-        "ACCEPTED",
-    )
-    calls_after_first_delivery = decisions.calls
-    decisions.unavailable = True
-
-    replay = ConfirmServiceStartUseCase(repository, decisions).execute(
-        decision_context,
-        SERVICE_IDS[0],
-        start_context.message_id,
-    )
-
-    assert replay.duplicate
-    assert replay.status is first_result.status
-    assert replay.outbox_message == first_result.outbox_message
-    assert decisions.calls == calls_after_first_delivery
-
-
-def test_reject_redelivery_uses_receipt_when_decision_store_is_unavailable(
-    repository,
-    lifecycle,
-):
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    decision_context, first_result = resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        start_context.message_id,
-        "REJECTED",
-    )
-    calls_after_first_delivery = decisions.calls
-    decisions.unavailable = True
-
-    replay = RejectServiceStartUseCase(repository, decisions).execute(
-        decision_context,
-        SERVICE_IDS[0],
-        start_context.message_id,
-    )
-
-    assert replay.duplicate
-    assert replay.status is first_result.status
-    assert replay.outbox_message == first_result.outbox_message
-    assert decisions.calls == calls_after_first_delivery
-
-
-def test_resolution_key_reuse_with_different_content_is_rejected_before_decision_lookup(
-    repository,
-    lifecycle,
-):
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    decision_context, _ = resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        start_context.message_id,
-        "ACCEPTED",
-    )
-    calls_after_first_delivery = decisions.calls
-
-    with pytest.raises(IdempotencyKeyReuseError):
-        ConfirmServiceStartUseCase(repository, decisions).execute(
-            decision_context,
-            SERVICE_IDS[1],
-            start_context.message_id,
-        )
-
-    assert decisions.calls == calls_after_first_delivery
-
-
-def test_confirm_records_parts_only_after_persisted_acceptance(repository, lifecycle):
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    decision_context, result = resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        start_context.message_id,
-        "ACCEPTED",
-    )
-
-    persisted, _ = repository.load_lifecycle(lifecycle.saga_id)
-    service = persisted.service(SERVICE_IDS[0])
+    lifecycle, version = repository.load_lifecycle(command["sagaId"])
+    service = lifecycle.service(101)
     assert result.status is ServiceStatus.EM_EXECUCAO
     assert service.started_at == STARTED_AT
-    assert service.parts_used == (PartConsumption(1, 10, 2),)
-    assert decision_context.message_id == service.start_resolution_message_id
+    assert service.parts_used == ()
+    assert version == 1
+    assert repository.get_service_command_receipt(message_id) is not None
 
-
-def test_rejection_is_explicit_and_old_redelivery_stays_idempotent(repository, lifecycle):
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    reject_context, rejected = resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        start_context.message_id,
-        "REJECTED",
+    consumption_message_id = str(uuid4())
+    consumed_result = work.record_consumption(
+        command["sagaId"],
+        101,
+        consumed,
+        message_id=consumption_message_id,
     )
-    assert rejected.status is ServiceStatus.PENDENTE
+    lifecycle, version = repository.load_lifecycle(command["sagaId"])
+    assert consumed_result.status is ServiceStatus.EM_EXECUCAO
+    assert lifecycle.service(101).parts_used == consumed
+    assert version == 2
+    assert repository.get_service_command_receipt(consumption_message_id) is not None
 
-    new_start_context, retried = start_service(
-        repository,
-        lifecycle,
-        SERVICE_IDS[0],
+
+def test_service_start_is_idempotent_and_validates_reserved_parts(execution):
+    repository, command, _result, work = execution
+    start_message_id = str(uuid4())
+    consumed = (PartConsumption(501, 10, 2),)
+
+    first = work.start_service(
+        command["sagaId"],
+        101,
+        started_at=STARTED_AT,
+        message_id=start_message_id,
     )
-    assert new_start_context.message_id != start_context.message_id
-    assert retried.status is ServiceStatus.INICIO_PENDENTE
-
-    replayed = RejectServiceStartUseCase(repository, decisions).execute(
-        reject_context,
-        SERVICE_IDS[0],
-        start_context.message_id,
+    replay = work.start_service(
+        command["sagaId"],
+        101,
+        started_at=STARTED_AT,
+        message_id=start_message_id,
     )
-    assert replayed.duplicate
-    assert (
-        repository.load_lifecycle(lifecycle.saga_id)[0].service(SERVICE_IDS[0]).start_message_id
-        == new_start_context.message_id
-    )
+    assert not first.duplicate
+    assert replay.duplicate
+    assert repository.load_lifecycle(command["sagaId"])[1] == 1
 
-
-def test_finish_last_service_persists_execucao_finalizada_once(repository, lifecycle):
-    decisions = PersistedDecisionFake()
-    for service_id in SERVICE_IDS:
-        start_context, _ = start_service(repository, lifecycle, service_id)
-        resolve_service(
-            repository,
-            decisions,
-            lifecycle,
-            service_id,
-            start_context.message_id,
-            "ACCEPTED",
+    with pytest.raises(IdempotencyKeyReuseError):
+        work.start_service(
+            command["sagaId"],
+            101,
+            started_at=STARTED_AT + timedelta(seconds=1),
+            message_id=start_message_id,
         )
 
-    first_finish = context(lifecycle)
-    first_result = FinishServiceUseCase(repository).execute(
-        first_finish,
-        SERVICE_IDS[0],
-        STARTED_AT + timedelta(hours=1),
+    consumption_message_id = str(uuid4())
+    first_consumption = work.record_consumption(
+        command["sagaId"],
+        101,
+        consumed,
+        message_id=consumption_message_id,
     )
-    assert first_result.status is ServiceStatus.CONCLUIDO
-    assert first_result.outbox_message is None
+    replay_consumption = work.record_consumption(
+        command["sagaId"],
+        101,
+        consumed,
+        message_id=consumption_message_id,
+    )
+    assert not first_consumption.duplicate
+    assert replay_consumption.duplicate
+    assert repository.load_lifecycle(command["sagaId"])[0].service(101).parts_used == consumed
+    work.start_service(command["sagaId"], 102, started_at=STARTED_AT)
 
-    final_context = context(lifecycle)
-    final_result = FinishServiceUseCase(repository).execute(
-        final_context,
-        SERVICE_IDS[1],
-        STARTED_AT + timedelta(hours=2),
+    with pytest.raises(IdempotencyKeyReuseError):
+        work.record_consumption(
+            command["sagaId"],
+            101,
+            (PartConsumption(501, 10, 1),),
+            message_id=consumption_message_id,
+        )
+
+    with pytest.raises(MessageValidationError, match="not reserved"):
+        work.record_consumption(
+            command["sagaId"],
+            102,
+            (PartConsumption(999, 10, 1),),
+        )
+
+    with pytest.raises(MessageValidationError, match="exceeds"):
+        work.record_consumption(
+            command["sagaId"],
+            102,
+            (PartConsumption(501, 10, 4),),
+        )
+
+
+def test_finishing_one_service_does_not_finalize_execution(execution):
+    repository, command, _result, work = execution
+    for service_id in (101, 102):
+        work.start_service(
+            command["sagaId"],
+            service_id,
+            started_at=STARTED_AT,
+        )
+
+    result = work.finish_service(
+        command["sagaId"],
+        101,
+        completed_at=STARTED_AT + timedelta(hours=1),
     )
-    assert final_result.status is ServiceStatus.CONCLUIDO
-    outbox = final_result.outbox_message
+
+    assert result.status is ServiceStatus.CONCLUIDO
+    assert result.outbox_message is None
+    assert repository.get_pending_outbox() == [repository.get_outbox(command["messageId"])]
+    assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.EM_EXECUCAO
+
+
+def test_last_service_emits_execucao_finalizada_once_with_aggregated_consumption(execution):
+    repository, command, _result, work = execution
+    first_part = (PartConsumption(501, 10, 2),)
+    second_parts = (PartConsumption(501, 10, 1), PartConsumption(502, 11, 1))
+    for service_id, consumed in ((101, first_part), (102, second_parts)):
+        work.start_service(
+            command["sagaId"],
+            service_id,
+            started_at=STARTED_AT,
+        )
+        work.record_consumption(command["sagaId"], service_id, consumed)
+
+    first = work.finish_service(
+        command["sagaId"],
+        101,
+        completed_at=STARTED_AT + timedelta(hours=1),
+    )
+    assert first.outbox_message is None
+    final = work.finish_service(
+        command["sagaId"],
+        102,
+        completed_at=STARTED_AT + timedelta(hours=2),
+    )
+    outbox = final.outbox_message
+    execution_id = repository.get_by_saga_id(command["sagaId"]).execution_id
+
     assert outbox is not None
     assert outbox.message["type"] == "ExecucaoFinalizada"
+    assert outbox.message["version"] == 1
     assert outbox.message["payload"] == {
-        "execucaoId": lifecycle.execution_id,
+        "execucaoId": execution_id,
         "finalizadaEm": (STARTED_AT + timedelta(hours=2)).isoformat(),
+        "pecasConsumidas": [
+            {"itemPecaOSId": 501, "pecaId": 10, "quantidade": 3},
+            {"itemPecaOSId": 502, "pecaId": 11, "quantidade": 1},
+        ],
     }
-    assert outbox.message["osId"] == lifecycle.os_id
-    assert outbox.message["sagaId"] == lifecycle.saga_id
-    assert outbox.input_message_id == final_context.message_id
-    assert repository.get_service_command_receipt(final_context.message_id).outbox_message == outbox
+    assert outbox.input_message_id is not None
+    assert outbox.message_attributes["traceparent"]["StringValue"].startswith(
+        f"00-{TRACE_ATTRIBUTES['traceparent']['StringValue'].split('-')[1]}-"
+    )
+    assert outbox.message_attributes["tracestate"] == TRACE_ATTRIBUTES["tracestate"]
+    assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.CONCLUIDA
 
-    replay = FinishServiceUseCase(repository).execute(
-        final_context,
-        SERVICE_IDS[1],
-        STARTED_AT + timedelta(hours=2),
+    replay = work.finish_service(
+        command["sagaId"],
+        102,
+        completed_at=STARTED_AT + timedelta(hours=2),
+        message_id=outbox.input_message_id,
     )
     assert replay.duplicate
     assert replay.outbox_message.message["messageId"] == outbox.message["messageId"]
-    assert repository.load_lifecycle(lifecycle.saga_id)[1] == 6
-
-
-def test_finish_rejects_invalid_date_and_non_running_service(repository, lifecycle):
-    with pytest.raises(TransitionNotAllowedError):
-        FinishServiceUseCase(repository).execute(
-            context(lifecycle),
-            SERVICE_IDS[0],
-            STARTED_AT,
+    assert (
+        len(
+            [
+                item
+                for item in repository.get_pending_outbox()
+                if item.message["type"] == "ExecucaoFinalizada"
+            ]
         )
-
-    start_context, _ = start_service(repository, lifecycle, SERVICE_IDS[0])
-    decisions = PersistedDecisionFake()
-    resolve_service(
-        repository,
-        decisions,
-        lifecycle,
-        SERVICE_IDS[0],
-        start_context.message_id,
-        "ACCEPTED",
+        == 1
     )
+
+
+def test_finish_requires_started_service_and_completed_at_not_before_start(execution):
+    _repository, command, _result, work = execution
+    with pytest.raises(TransitionNotAllowedError):
+        work.finish_service(command["sagaId"], 101, completed_at=STARTED_AT)
+
+    work.start_service(command["sagaId"], 101, started_at=STARTED_AT)
     with pytest.raises(MessageValidationError, match="earlier"):
-        FinishServiceUseCase(repository).execute(
-            context(lifecycle),
-            SERVICE_IDS[0],
-            STARTED_AT - timedelta(seconds=1),
+        work.finish_service(
+            command["sagaId"],
+            101,
+            completed_at=STARTED_AT - timedelta(seconds=1),
         )
 
 
-def test_service_command_persistence_failure_does_not_change_stored_lifecycle(
-    repository,
-    lifecycle,
-):
-    class FailedCommitRepository(InMemoryServiceExecutionRepository):
-        def load_lifecycle(self, saga_id):
-            return repository.load_lifecycle(saga_id)
+def test_concurrent_finishing_of_different_services_emits_one_completion(execution):
+    repository, command, _result, work = execution
+    for service_id in (101, 102):
+        work.start_service(command["sagaId"], service_id, started_at=STARTED_AT)
 
-        def get_service_command_receipt(self, message_id):
-            return repository.get_service_command_receipt(message_id)
+    barrier = Barrier(2)
+    commit_lock = Lock()
+    commit_calls = 0
+    commit = repository.commit_service_command
 
-        def commit_service_command(self, *args, **kwargs):
-            raise RuntimeError("persistence failed")
+    def synchronized_commit(*args, **kwargs):
+        nonlocal commit_calls
+        with commit_lock:
+            commit_calls += 1
+            call_number = commit_calls
+        if call_number <= 2:
+            barrier.wait()
+        return commit(*args, **kwargs)
 
-    with pytest.raises(RuntimeError, match="persistence failed"):
-        StartServiceUseCase(FailedCommitRepository()).execute(
-            context(lifecycle),
-            SERVICE_IDS[0],
-            STARTED_AT,
-            (),
+    repository.commit_service_command = synchronized_commit
+
+    def finish(service_id):
+        return work.finish_service(
+            command["sagaId"],
+            service_id,
+            completed_at=STARTED_AT + timedelta(hours=1),
         )
 
-    persisted, version = repository.load_lifecycle(lifecycle.saga_id)
-    assert persisted.service(SERVICE_IDS[0]).status is ServiceStatus.PENDENTE
-    assert version == 0
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(finish, (101, 102)))
+
+    completed = [result for result in results if result.outbox_message is not None]
+    assert len(completed) == 1
+    assert commit_calls >= 3
+    assert completed[0].outbox_message.message["type"] == "ExecucaoFinalizada"
+    assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.CONCLUIDA
 
 
-def test_service_command_rejects_unknown_service(repository, lifecycle):
-    with pytest.raises(MessageValidationError, match="does not belong"):
-        StartServiceUseCase(repository).execute(
-            context(lifecycle),
-            999,
-            STARTED_AT,
-            (),
-        )
+def test_cancellation_stops_unfinished_services_and_releases_via_contract_response(execution):
+    repository, command, _result, _work = execution
+    cancellation = {
+        **command,
+        "messageId": str(uuid4()),
+        "type": "CancelarExecucao",
+        "causationId": command["messageId"],
+        "payload": {
+            "execucaoId": repository.get_by_saga_id(command["sagaId"]).execution_id,
+            "motivo": "CANCELADO_PELO_CLIENTE",
+        },
+    }
+    result = ExecuteCommandUseCase(repository).handle(cancellation, TRACE_ATTRIBUTES)
+
+    saved = repository.get_by_saga_id(command["sagaId"])
+    lifecycle, _version = repository.load_lifecycle(command["sagaId"])
+    outbox = repository.get_outbox(cancellation["messageId"])
+    assert result.message_type == "ExecucaoCancelada"
+    assert saved.status is ExecutionStatus.CANCELADA
+    assert saved.cancellation_reason == "CANCELADO_PELO_CLIENTE"
+    assert lifecycle.service(101).status is ServiceStatus.CANCELADO
+    assert lifecycle.service(102).status is ServiceStatus.CANCELADO
+    assert outbox.message["payload"] == {"execucaoId": saved.execution_id}
+
+
+def test_cancellation_after_failure_is_supported_and_idempotent(execution):
+    repository, command, _result, _work = execution
+    record = repository.records[command["sagaId"]]
+    record.status = ExecutionStatus.FALHOU
+    cancellation = {
+        **command,
+        "messageId": str(uuid4()),
+        "type": "CancelarExecucao",
+        "causationId": command["messageId"],
+        "payload": {
+            "execucaoId": record.execution_id,
+            "motivo": "EXECUCAO_FALHOU",
+        },
+    }
+    processor = ExecuteCommandUseCase(repository)
+    result = processor.handle(cancellation)
+    replay = processor.handle(cancellation)
+
+    assert result.message_type == "ExecucaoCancelada"
+    assert replay.message_id == result.message_id
+    assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.CANCELADA
+
+
+def test_v11_item_peca_os_id_is_optional_for_legacy_start_messages():
+    command = start_message()
+    command["payload"]["pecas"] = [{"pecaId": 9, "quantidade": 1}]
+    repository = InMemoryExecutionRepository()
+    ExecuteCommandUseCase(repository).handle(command)
+
+    lifecycle, _version = repository.load_lifecycle(command["sagaId"])
+    assert lifecycle.reserved_parts == (PartConsumption(None, 9, 1),)
+    assert len(lifecycle.services) == 1
