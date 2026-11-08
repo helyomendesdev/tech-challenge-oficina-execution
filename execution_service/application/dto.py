@@ -56,6 +56,8 @@ class ServiceExecutionCommandContext:
     os_id: int
     message_id: str
     request_id: str
+    traceparent: str | None = None
+    tracestate: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("saga_id", "execution_id", "message_id"):
@@ -66,28 +68,6 @@ class ServiceExecutionCommandContext:
             raise MessageValidationError("os_id must be a positive integer")
         if not isinstance(self.request_id, str) or not 1 <= len(self.request_id) <= 128:
             raise MessageValidationError("request_id must contain between 1 and 128 characters")
-
-
-@dataclass(frozen=True)
-class PersistedServiceStartDecision:
-    saga_id: str
-    os_id: int
-    service_id: int
-    start_message_id: str
-    decision_message_id: str
-    outcome: str
-
-    def __post_init__(self) -> None:
-        for field_name in ("saga_id", "start_message_id", "decision_message_id"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not _UUID.fullmatch(value):
-                raise MessageValidationError(f"{field_name} must be a lowercase RFC 4122 UUID")
-        for field_name in ("os_id", "service_id"):
-            value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise MessageValidationError(f"{field_name} must be a positive integer")
-        if self.outcome not in ("ACCEPTED", "REJECTED"):
-            raise MessageValidationError("outcome must be ACCEPTED or REJECTED")
 
 
 @dataclass(frozen=True)

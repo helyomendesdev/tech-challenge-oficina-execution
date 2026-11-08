@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -15,13 +16,14 @@ from execution_service.application.dto import (
 from execution_service.application.ports import ExecutionRepositoryPort
 from execution_service.domain.enums import ExecutionStatus, SagaMessageType
 from execution_service.domain.exceptions import (
-    ExecutionCancellationUnavailableError,
+    ConcurrentExecutionUpdateError,
     IdempotencyKeyReuseError,
     MessageValidationError,
     UnsupportedMessageError,
 )
 from execution_service.domain.models import ExecutionRecord
 from execution_service.domain.policies import ExecutionStatusPolicy
+from execution_service.domain.service_execution import ExecutionLifecycle, PartConsumption
 
 _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
@@ -207,25 +209,31 @@ class ExecutionMessageValidator:
 
         cls._uuid(payload["orcamentoId"], "payload.orcamentoId")
 
-        for field_name, id_name in (
-            ("servicos", "servicoId"),
-            ("pecas", "pecaId"),
-        ):
+        for field_name, id_name in (("servicos", "servicoId"), ("pecas", "pecaId")):
             entries = payload[field_name]
 
             if not isinstance(entries, list):
                 raise MessageValidationError(f"payload.{field_name} must be an array")
 
             for index, entry in enumerate(entries):
-                if not isinstance(entry, dict) or set(entry) != {
-                    id_name,
-                    "quantidade",
-                }:
+                allowed_fields = {id_name, "quantidade"}
+                if field_name == "pecas":
+                    allowed_fields.add("itemPecaOSId")
+                if (
+                    not isinstance(entry, dict)
+                    or not {"pecaId" if field_name == "pecas" else id_name, "quantidade"}.issubset(
+                        entry
+                    )
+                    or not set(entry).issubset(allowed_fields)
+                ):
                     raise MessageValidationError(
                         f"payload.{field_name}[{index}] has invalid fields"
                     )
 
-                for key in (id_name, "quantidade"):
+                keys = [id_name, "quantidade"]
+                if field_name == "pecas" and "itemPecaOSId" in entry:
+                    keys.append("itemPecaOSId")
+                for key in keys:
                     value = entry[key]
 
                     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -289,25 +297,66 @@ class ExecuteCommandUseCase:
                 return existing_result
 
         expected_version = current.version if current else None
+        lifecycle: ExecutionLifecycle
+        expected_lifecycle_version: int | None
+        cancellation_reason: str | None = None
 
         if command.type == SagaMessageType.INICIAR_EXECUCAO.value:
             if current is not None:
                 ExecutionStatusPolicy.validate_start(current.status)
 
             record, response = self._start_execution(command, current)
+            lifecycle = _lifecycle_for(command, record)
+            expected_lifecycle_version = None
         else:
-            raise ExecutionCancellationUnavailableError(
-                "CancelarExecucao is blocked until the execution worker and the "
-                "owner of reserved-stock compensation are defined"
+            if current is None:
+                raise MessageValidationError(f"Execution not found for sagaId={command.saga_id}")
+            if command.payload["execucaoId"] != current.execution_id:
+                raise MessageValidationError(
+                    "CancelarExecucao execucaoId does not match the persisted execution"
+                )
+            if current.status not in {ExecutionStatus.EM_EXECUCAO, ExecutionStatus.FALHOU}:
+                raise MessageValidationError(
+                    f"Cannot cancel an execution while status is {current.status.value}"
+                )
+            loaded_lifecycle = self.repository.load_lifecycle(command.saga_id)
+            if loaded_lifecycle is None:
+                raise RuntimeError(f"Execution lifecycle missing for sagaId={command.saga_id}")
+            lifecycle, expected_lifecycle_version = loaded_lifecycle
+            cancellation_reason = command.payload["motivo"]
+            lifecycle.cancel(command.message_id, cancellation_reason)
+            now = datetime.now(timezone.utc)
+            record = replace(
+                current,
+                status=ExecutionStatus.CANCELADA,
+                updated_at=now,
+                version=current.version + 1,
+                cancellation_reason=cancellation_reason,
+            )
+            response = self._response(
+                command,
+                SagaMessageType.EXECUCAO_CANCELADA.value,
+                {"execucaoId": record.execution_id},
+                command.traceparent,
+                command.tracestate,
             )
 
-        self.repository.register_command(
+        committed = self.repository.register_command(
             record=record,
             input_message_id=command.message_id,
             input_fingerprint=body_fingerprint,
             response=response,
             expected_version=expected_version,
+            lifecycle=lifecycle,
+            expected_lifecycle_version=expected_lifecycle_version,
         )
+        if not committed:
+            duplicate = self._existing_result(command, body_fingerprint)
+            if duplicate is not None:
+                return duplicate
+            raise ConcurrentExecutionUpdateError(
+                "Concurrent command changed the execution state; retry the command"
+            )
 
         outbox = self.repository.get_outbox(command.message_id)
 
@@ -452,3 +501,27 @@ def _child_traceparent(parent: str | None) -> str:
     version, trace_id, _parent_span_id, flags = match.groups()
 
     return f"{version}-{trace_id}-{uuid4().hex[:16]}-{flags}"
+
+
+def _lifecycle_for(
+    command: ExecutionEnvelope,
+    record: ExecutionRecord,
+) -> ExecutionLifecycle:
+    service_ids = tuple(dict.fromkeys(service["servicoId"] for service in record.services))
+    reserved_parts = tuple(
+        PartConsumption(
+            item_peca_os_id=part.get("itemPecaOSId"),
+            peca_id=part["pecaId"],
+            quantity=part["quantidade"],
+        )
+        for part in record.parts
+    )
+    return ExecutionLifecycle(
+        os_id=record.os_id,
+        saga_id=record.saga_id,
+        execution_id=record.execution_id,
+        service_ids=service_ids,
+        reserved_parts=reserved_parts,
+        traceparent=command.traceparent,
+        tracestate=command.tracestate,
+    )

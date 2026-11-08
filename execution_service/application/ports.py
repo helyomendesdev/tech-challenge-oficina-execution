@@ -5,44 +5,10 @@ from typing import Any
 
 from execution_service.application.dto import (
     OutboxMessage,
-    PersistedServiceStartDecision,
     ServiceCommandReceipt,
 )
 from execution_service.domain.models import ExecutionRecord
 from execution_service.domain.service_execution import ExecutionLifecycle, ServiceStatus
-
-
-class ExecutionRepositoryPort(ABC):
-    @abstractmethod
-    def get_by_saga_id(self, saga_id: str) -> ExecutionRecord | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_input_fingerprint(self, message_id: str) -> str | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def register_command(
-        self,
-        record: ExecutionRecord,
-        input_message_id: str,
-        input_fingerprint: str,
-        response: OutboxMessage,
-        expected_version: int | None,
-    ) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_outbox(self, input_message_id: str) -> OutboxMessage | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_pending_outbox(self, limit: int = 10) -> list[OutboxMessage]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def mark_outbox_published(self, input_message_id: str) -> None:
-        raise NotImplementedError
 
 
 class ServiceExecutionRepositoryPort(ABC):
@@ -72,13 +38,38 @@ class ServiceExecutionRepositoryPort(ABC):
         raise NotImplementedError
 
 
-class PersistedServiceStartDecisionPort(ABC):
+class ExecutionRepositoryPort(ServiceExecutionRepositoryPort, ABC):
     @abstractmethod
-    def get_persisted_decision(
+    def get_by_saga_id(self, saga_id: str) -> ExecutionRecord | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_input_fingerprint(self, message_id: str) -> str | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def register_command(
         self,
-        decision_message_id: str,
-    ) -> PersistedServiceStartDecision | None:
-        """Return only a durably accepted OS/Saga decision, or None if it is unavailable."""
+        record: ExecutionRecord,
+        input_message_id: str,
+        input_fingerprint: str,
+        response: OutboxMessage,
+        expected_version: int | None,
+        lifecycle: ExecutionLifecycle | None = None,
+        expected_lifecycle_version: int | None = None,
+    ) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_outbox(self, input_message_id: str) -> OutboxMessage | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_pending_outbox(self, limit: int = 10) -> list[OutboxMessage]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def mark_outbox_published(self, input_message_id: str) -> None:
         raise NotImplementedError
 
 
