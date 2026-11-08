@@ -122,6 +122,7 @@ data "aws_iam_policy_document" "execution_runtime" {
 }
 
 resource "aws_iam_policy" "execution_runtime" {
+  count  = var.create_runtime_policy ? 1 : 0
   name   = var.execution_runtime_policy_name
   policy = data.aws_iam_policy_document.execution_runtime.json
 }

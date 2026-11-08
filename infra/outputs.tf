@@ -15,5 +15,6 @@ output "execution_table_arn" {
 }
 
 output "execution_runtime_policy_arn" {
-  value = aws_iam_policy.execution_runtime.arn
+  description = "Runtime policy ARN, or null when create_runtime_policy is false."
+  value       = try(aws_iam_policy.execution_runtime[0].arn, null)
 }

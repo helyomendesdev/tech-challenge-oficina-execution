@@ -58,6 +58,7 @@ variable "saga_responses_queue_arn" {
 variable "execution_runtime_policy_name" {
   description = "IAM policy name for the workload identity used by this service."
   type        = string
+  default     = "execution-service-runtime"
 
   validation {
     condition = (
@@ -66,6 +67,12 @@ variable "execution_runtime_policy_name" {
     )
     error_message = "The IAM policy name must contain between 1 and 128 characters."
   }
+}
+
+variable "create_runtime_policy" {
+  description = "Whether to create the IAM runtime policy; disable when the account cannot manage IAM."
+  type        = bool
+  default     = true
 }
 
 variable "visibility_timeout_seconds" {
