@@ -1,6 +1,6 @@
 from .enums import ExecutionStatus, SagaMessageType
 from .exceptions import (
-    ExecutionCancellationUnavailableError,
+    ConcurrentExecutionUpdateError,
     IdempotencyKeyReuseError,
     MessageValidationError,
     TransitionNotAllowedError,
@@ -18,7 +18,7 @@ from .service_execution import (
 __all__ = [
     "ExecutionStatus",
     "SagaMessageType",
-    "ExecutionCancellationUnavailableError",
+    "ConcurrentExecutionUpdateError",
     "IdempotencyKeyReuseError",
     "MessageValidationError",
     "TransitionNotAllowedError",
