@@ -347,57 +347,93 @@ class ExecuteCommandUseCase:
             if existing_result is not None:
                 return existing_result
 
-        expected_version = current.version if current else None
-        lifecycle: ExecutionLifecycle
-        expected_lifecycle_version: int | None
-        cancellation_reason: str | None = None
-
         if command.type == SagaMessageType.INICIAR_EXECUCAO.value:
-            if current is not None:
-                ExecutionStatusPolicy.validate_start(current.status)
-
-            record, response = self._start_execution(command, current)
-            lifecycle = _lifecycle_for(command, record)
-            expected_lifecycle_version = None
-        else:
-            if current is None:
-                raise MessageValidationError(f"Execution not found for sagaId={command.saga_id}")
-            if command.payload["execucaoId"] != current.execution_id:
-                raise MessageValidationError(
-                    "CancelarExecucao execucaoId does not match the persisted execution"
-                )
-            if current.status not in {ExecutionStatus.EM_EXECUCAO, ExecutionStatus.FALHOU}:
-                raise MessageValidationError(
-                    f"Cannot cancel an execution while status is {current.status.value}"
-                )
-            loaded_lifecycle = self.repository.load_lifecycle(command.saga_id)
-            if loaded_lifecycle is None:
-                raise RuntimeError(f"Execution lifecycle missing for sagaId={command.saga_id}")
-            lifecycle, expected_lifecycle_version = loaded_lifecycle
-            cancellation_reason = command.payload["motivo"]
-            lifecycle.cancel(command.message_id, cancellation_reason)
-            now = datetime.now(timezone.utc)
-            record = replace(
-                current,
-                status=ExecutionStatus.CANCELADA,
-                updated_at=now,
-                version=current.version + 1,
-                cancellation_reason=cancellation_reason,
-            )
-            response = self._response(
+            record, response, lifecycle, expected_lifecycle_version = self._prepare_start(
                 command,
-                SagaMessageType.EXECUCAO_CANCELADA.value,
-                {"execucaoId": record.execution_id},
-                command.traceparent,
-                command.tracestate,
+                current,
+            )
+        else:
+            record, response, lifecycle, expected_lifecycle_version = self._prepare_cancellation(
+                command,
+                current,
             )
 
+        return self._persist_command(
+            command,
+            body_fingerprint,
+            current,
+            record,
+            response,
+            lifecycle,
+            expected_lifecycle_version,
+        )
+
+    def _prepare_start(
+        self,
+        command: ExecutionEnvelope,
+        current: ExecutionRecord | None,
+    ) -> tuple[ExecutionRecord, OutboxMessage, ExecutionLifecycle, None]:
+        if current is not None:
+            ExecutionStatusPolicy.validate_start(current.status)
+
+        record, response = self._start_execution(command, current)
+        lifecycle = _lifecycle_for(command, record)
+        return record, response, lifecycle, None
+
+    def _prepare_cancellation(
+        self,
+        command: ExecutionEnvelope,
+        current: ExecutionRecord | None,
+    ) -> tuple[ExecutionRecord, OutboxMessage, ExecutionLifecycle, int]:
+        if current is None:
+            raise MessageValidationError(f"Execution not found for sagaId={command.saga_id}")
+        if command.payload["execucaoId"] != current.execution_id:
+            raise MessageValidationError(
+                "CancelarExecucao execucaoId does not match the persisted execution"
+            )
+        if current.status not in {ExecutionStatus.EM_EXECUCAO, ExecutionStatus.FALHOU}:
+            raise MessageValidationError(
+                f"Cannot cancel an execution while status is {current.status.value}"
+            )
+        loaded_lifecycle = self.repository.load_lifecycle(command.saga_id)
+        if loaded_lifecycle is None:
+            raise RuntimeError(f"Execution lifecycle missing for sagaId={command.saga_id}")
+        lifecycle, expected_lifecycle_version = loaded_lifecycle
+        cancellation_reason = command.payload["motivo"]
+        lifecycle.cancel(command.message_id, cancellation_reason)
+        now = datetime.now(timezone.utc)
+        record = replace(
+            current,
+            status=ExecutionStatus.CANCELADA,
+            updated_at=now,
+            version=current.version + 1,
+            cancellation_reason=cancellation_reason,
+        )
+        response = self._response(
+            command,
+            SagaMessageType.EXECUCAO_CANCELADA.value,
+            {"execucaoId": record.execution_id},
+            command.traceparent,
+            command.tracestate,
+        )
+        return record, response, lifecycle, expected_lifecycle_version
+
+    def _persist_command(
+        self,
+        command: ExecutionEnvelope,
+        body_fingerprint: str,
+        current: ExecutionRecord | None,
+        record: ExecutionRecord,
+        response: OutboxMessage,
+        lifecycle: ExecutionLifecycle,
+        expected_lifecycle_version: int | None,
+    ) -> ExecutionResult:
         committed = self.repository.register_command(
             record=record,
             input_message_id=command.message_id,
             input_fingerprint=body_fingerprint,
             response=response,
-            expected_version=expected_version,
+            expected_version=current.version if current is not None else None,
             lifecycle=lifecycle,
             expected_lifecycle_version=expected_lifecycle_version,
         )
