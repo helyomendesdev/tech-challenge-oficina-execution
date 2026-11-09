@@ -367,6 +367,7 @@ def test_sqs_publisher_rejects_non_finite_decimal_values():
             raise AssertionError(f"send_message should not be called: {kwargs}")
 
     publisher = SQSFifoMessagePublisher(SQS(), "responses")
+    non_finite_os_id = Decimal("NaN")
 
     with pytest.raises(ValueError, match="non-finite"):
         publisher.publish(
@@ -374,7 +375,7 @@ def test_sqs_publisher_rejects_non_finite_decimal_values():
                 "messageId": "message-1",
                 "type": "ExecucaoIniciada",
                 "sagaId": "saga-1",
-                "osId": Decimal("NaN"),
+                "osId": non_finite_os_id,
                 "requestId": "request-1",
             },
             message_group_id="saga-1",
@@ -869,21 +870,25 @@ def test_dynamodb_repository_enforces_atomic_create_and_idempotency_key():
         None,
     )
 
+    conflicting_record = execution_record(record.saga_id)
+    conflicting_input_id = str(uuid4())
+    conflicting_outbox = outbox_message()
     with pytest.raises(ConcurrentExecutionUpdateError):
         repository.register_command(
-            execution_record(record.saga_id),
-            str(uuid4()),
+            conflicting_record,
+            conflicting_input_id,
             "another-body",
-            outbox_message(),
+            conflicting_outbox,
             None,
         )
 
+    mismatched_outbox = outbox_message()
     with pytest.raises(IdempotencyKeyReuseError):
         repository.register_command(
             record,
             input_id,
             "different-body",
-            outbox_message(),
+            mismatched_outbox,
             None,
         )
 

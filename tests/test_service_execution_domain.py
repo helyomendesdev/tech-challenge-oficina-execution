@@ -27,8 +27,9 @@ def message_id(name: str) -> str:
 
 def test_service_start_and_consumption_are_separate_transitions():
     service = ServiceExecution(4)
+    consume_id = message_id("consume")
     with pytest.raises(TransitionNotAllowedError):
-        service.record_consumption(message_id("consume"), RESERVED)
+        service.record_consumption(consume_id, RESERVED)
 
     assert service.request_service_start(
         message_id("start"),
@@ -39,35 +40,34 @@ def test_service_start_and_consumption_are_separate_transitions():
     assert service.parts_used == ()
 
     assert not service.request_service_start(message_id("start"), STARTED_AT)
+    reused_start_id = message_id("start")
+    reused_start_time = STARTED_AT + timedelta(seconds=1)
     with pytest.raises(IdempotencyKeyReuseError):
-        service.request_service_start(
-            message_id("start"),
-            STARTED_AT + timedelta(seconds=1),
-        )
-    assert service.record_consumption(message_id("consume"), RESERVED)
+        service.request_service_start(reused_start_id, reused_start_time)
+    assert service.record_consumption(consume_id, RESERVED)
     assert service.parts_used == RESERVED
-    assert not service.record_consumption(message_id("consume"), RESERVED)
+    assert not service.record_consumption(consume_id, RESERVED)
+    changed_parts = (PartConsumption(31, 9, 2),)
     with pytest.raises(IdempotencyKeyReuseError):
-        service.record_consumption(message_id("consume"), (PartConsumption(31, 9, 2),))
+        service.record_consumption(consume_id, changed_parts)
 
 
 def test_finish_requires_running_service_and_monotonic_datetime():
     service = ServiceExecution(4)
+    finish_id = message_id("finish")
     with pytest.raises(TransitionNotAllowedError):
-        service.finish_service(message_id("finish"), STARTED_AT)
+        service.finish_service(finish_id, STARTED_AT)
 
     service.request_service_start(message_id("start"), STARTED_AT)
+    earlier_finish_time = STARTED_AT - timedelta(seconds=1)
     with pytest.raises(MessageValidationError, match="earlier"):
-        service.finish_service(
-            message_id("finish"),
-            STARTED_AT - timedelta(seconds=1),
-        )
+        service.finish_service(finish_id, earlier_finish_time)
 
     completed = STARTED_AT + timedelta(hours=1)
-    assert service.finish_service(message_id("finish"), completed)
+    assert service.finish_service(finish_id, completed)
     assert service.status is ServiceStatus.CONCLUIDO
     assert service.completed_at == completed
-    assert not service.finish_service(message_id("finish"), completed)
+    assert not service.finish_service(finish_id, completed)
 
 
 def test_service_failure_is_terminal_and_idempotent():
@@ -88,8 +88,9 @@ def test_service_failure_is_terminal_and_idempotent():
     )
     with pytest.raises(IdempotencyKeyReuseError):
         service.fail_service(failure_id, "OUTRO_MOTIVO", "Outra falha.")
+    finish_failed_id = message_id("finish-failed")
     with pytest.raises(TransitionNotAllowedError):
-        service.finish_service(message_id("finish-failed"), STARTED_AT)
+        service.finish_service(finish_failed_id, STARTED_AT)
 
 
 def test_lifecycle_emits_one_completion_after_every_service_and_reports_consumed_parts():
@@ -134,16 +135,17 @@ def test_lifecycle_validates_consumption_and_service_ownership():
         reserved_parts=(PartConsumption(31, 9, 2),),
     )
     lifecycle.start_service(4, message_id("start"), STARTED_AT)
+    unreserved_consumption_id = message_id("consume-1")
+    unreserved_parts = (PartConsumption(32, 9, 1),)
     with pytest.raises(MessageValidationError, match="not reserved"):
-        lifecycle.record_service_consumption(
-            4, message_id("consume-1"), (PartConsumption(32, 9, 1),)
-        )
+        lifecycle.record_service_consumption(4, unreserved_consumption_id, unreserved_parts)
+    excessive_consumption_id = message_id("consume-2")
+    excessive_parts = (PartConsumption(31, 9, 3),)
     with pytest.raises(MessageValidationError, match="exceeds"):
-        lifecycle.record_service_consumption(
-            4, message_id("consume-2"), (PartConsumption(31, 9, 3),)
-        )
+        lifecycle.record_service_consumption(4, excessive_consumption_id, excessive_parts)
+    unknown_service_start_id = message_id("start-3")
     with pytest.raises(MessageValidationError, match="does not belong"):
-        lifecycle.start_service(999, message_id("start-3"), STARTED_AT)
+        lifecycle.start_service(999, unknown_service_start_id, STARTED_AT)
 
 
 def test_lifecycle_state_round_trip_preserves_service_and_trace_data():

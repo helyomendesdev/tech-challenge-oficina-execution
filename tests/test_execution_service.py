@@ -293,9 +293,10 @@ def test_failure_to_persist_does_not_create_idempotency_or_outbox(
 
     repository = FailRepository()
     message = start_message()
+    processor = processor_factory(repository)
 
     with pytest.raises(RuntimeError, match="DynamoDB unavailable"):
-        processor_factory(repository).handle(message)
+        processor.handle(message)
 
     assert repository.get_input_fingerprint(message["messageId"]) is None
     assert repository.get_outbox(message["messageId"]) is None

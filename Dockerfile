@@ -15,7 +15,7 @@ RUN groupadd --system --gid 10001 execution \
 
 COPY requirements.txt ./
 
-RUN python -m pip install --no-cache-dir --only-binary :all: -r requirements.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary :all: -r requirements.txt
 
 COPY --chown=10001:10001 execution_service ./execution_service
 # Dono root, modo 755: o usuario 10001 executa o entrypoint, mas nao consegue alterar.

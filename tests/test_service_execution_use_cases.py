@@ -94,11 +94,12 @@ def test_service_start_is_idempotent_and_validates_reserved_parts(execution):
     assert replay.duplicate
     assert repository.load_lifecycle(command["sagaId"])[1] == 1
 
+    reused_start_time = STARTED_AT + timedelta(seconds=1)
     with pytest.raises(IdempotencyKeyReuseError):
         work.start_service(
             command["sagaId"],
             101,
-            started_at=STARTED_AT + timedelta(seconds=1),
+            started_at=reused_start_time,
             message_id=start_message_id,
         )
 
@@ -120,26 +121,29 @@ def test_service_start_is_idempotent_and_validates_reserved_parts(execution):
     assert repository.load_lifecycle(command["sagaId"])[0].service(101).parts_used == consumed
     work.start_service(command["sagaId"], 102, started_at=STARTED_AT)
 
+    changed_consumption = (PartConsumption(501, 10, 1),)
     with pytest.raises(IdempotencyKeyReuseError):
         work.record_consumption(
             command["sagaId"],
             101,
-            (PartConsumption(501, 10, 1),),
+            changed_consumption,
             message_id=consumption_message_id,
         )
 
+    unreserved_parts = (PartConsumption(999, 10, 1),)
     with pytest.raises(MessageValidationError, match="not reserved"):
         work.record_consumption(
             command["sagaId"],
             102,
-            (PartConsumption(999, 10, 1),),
+            unreserved_parts,
         )
 
+    excessive_parts = (PartConsumption(501, 10, 4),)
     with pytest.raises(MessageValidationError, match="exceeds"):
         work.record_consumption(
             command["sagaId"],
             102,
-            (PartConsumption(501, 10, 4),),
+            excessive_parts,
         )
 
 
@@ -286,11 +290,12 @@ def test_finish_requires_started_service_and_completed_at_not_before_start(execu
         work.finish_service(command["sagaId"], 101, completed_at=STARTED_AT)
 
     work.start_service(command["sagaId"], 101, started_at=STARTED_AT)
+    earlier_finish_time = STARTED_AT - timedelta(seconds=1)
     with pytest.raises(MessageValidationError, match="earlier"):
         work.finish_service(
             command["sagaId"],
             101,
-            completed_at=STARTED_AT - timedelta(seconds=1),
+            completed_at=earlier_finish_time,
         )
 
 
