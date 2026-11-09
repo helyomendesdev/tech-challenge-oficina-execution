@@ -8,6 +8,7 @@ from execution_service.application.dto import (
     ServiceCommandReceipt,
 )
 from execution_service.application.ports import ServiceExecutionRepositoryPort
+from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.exceptions import IdempotencyKeyReuseError
 from execution_service.domain.service_execution import ExecutionLifecycle, ServiceStatus
 
@@ -47,6 +48,7 @@ class InMemoryServiceExecutionRepository(ServiceExecutionRepositoryPort):
         status: ServiceStatus,
         outbox_message: OutboxMessage | None,
         expected_version: int,
+        execution_status: ExecutionStatus | None = None,
     ) -> bool:
         with self._lock:
             previous = self._receipts.get(message_id)

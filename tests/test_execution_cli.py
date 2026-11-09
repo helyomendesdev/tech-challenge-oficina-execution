@@ -14,6 +14,8 @@ from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.service_execution import PartConsumption
 from execution_service.infrastructure.dynamodb_repository import DynamoDBExecutionRepository
 from execution_service.infrastructure.fake_repository import InMemoryExecutionRepository
+from execution_service.infrastructure.outbox_relay import OutboxRelay
+from execution_service.infrastructure.sqs_adapter import FakeMessagePublisher
 from tests.factories import TRACE_ATTRIBUTES, start_message
 
 STARTED_AT = datetime(2026, 11, 1, 10, tzinfo=timezone.utc)
@@ -150,6 +152,75 @@ def test_cli_finishing_last_service_reports_execution_completion(cli_execution, 
     assert response["executionCompleted"] is True
     assert response["outboxMessageType"] == "ExecucaoFinalizada"
     assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.CONCLUIDA
+
+
+def test_cli_fails_service_and_reports_failure_event(cli_execution, capsys):
+    repository, command, work = cli_execution
+    work.start_service(command["sagaId"], 101, started_at=STARTED_AT)
+    message_id = str(uuid4())
+    arguments = [
+        "fail-service",
+        "--saga-id",
+        command["sagaId"],
+        "--service-id",
+        "101",
+        "--error-code",
+        "SERVICO_INDISPONIVEL",
+        "--error-message",
+        "Serviço indisponível.",
+        "--message-id",
+        message_id,
+    ]
+
+    exit_code, response = _run_cli(arguments, work, capsys)
+    retry_exit_code, retry_response = _run_cli(arguments, work, capsys)
+
+    assert exit_code == retry_exit_code == 0
+    assert response["operation"] == "fail-service"
+    assert response["serviceStatus"] == "FALHOU"
+    assert response["duplicate"] is False
+    assert response["executionCompleted"] is False
+    assert response["outboxMessageType"] == "ExecucaoFalhou"
+    assert retry_response["duplicate"] is True
+    assert retry_response["messageId"] == message_id
+
+    saved = repository.get_by_saga_id(command["sagaId"])
+    outbox = repository.get_outbox(message_id)
+    assert saved.status is ExecutionStatus.FALHOU
+    assert outbox is not None
+    assert outbox.message == {
+        "messageId": outbox.message["messageId"],
+        "type": "ExecucaoFalhou",
+        "version": 1,
+        "sagaId": command["sagaId"],
+        "osId": command["osId"],
+        "causationId": command["messageId"],
+        "requestId": command["requestId"],
+        "occurredAt": outbox.message["occurredAt"],
+        "payload": {
+            "orcamentoId": command["payload"]["orcamentoId"],
+            "execucaoId": saved.execution_id,
+            "erro": {
+                "codigo": "SERVICO_INDISPONIVEL",
+                "mensagem": "Serviço indisponível.",
+            },
+        },
+    }
+    assert "traceparent" not in outbox.message
+    assert outbox.message_attributes["traceparent"]["DataType"] == "String"
+    assert outbox.message_attributes["traceparent"]["StringValue"].startswith(
+        f"00-{TRACE_ATTRIBUTES['traceparent']['StringValue'].split('-')[1]}-"
+    )
+    assert outbox.message_attributes["tracestate"]["StringValue"] == "vendor=value"
+
+    publisher = FakeMessagePublisher()
+    assert OutboxRelay(repository, publisher).poll_once() == 2
+    published = publisher.messages[-1]
+    assert published["message"] == outbox.message
+    assert published["message_group_id"] == command["sagaId"]
+    assert published["message_deduplication_id"] == outbox.message["messageId"]
+    assert published["message_attributes"] == outbox.message_attributes
+    assert repository.get_outbox(message_id).published is True
 
 
 def test_cli_rejects_invalid_arguments_as_json(capsys):

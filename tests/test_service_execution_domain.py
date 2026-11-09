@@ -70,6 +70,28 @@ def test_finish_requires_running_service_and_monotonic_datetime():
     assert not service.finish_service(message_id("finish"), completed)
 
 
+def test_service_failure_is_terminal_and_idempotent():
+    service = ServiceExecution(4)
+    failure_id = message_id("failure")
+    assert service.fail_service(
+        failure_id,
+        "PECA_INDISPONIVEL",
+        "Peça indisponível.",
+    )
+    assert service.status is ServiceStatus.FALHOU
+    assert service.failure_code == "PECA_INDISPONIVEL"
+    assert service.failure_message == "Peça indisponível."
+    assert not service.fail_service(
+        failure_id,
+        "PECA_INDISPONIVEL",
+        "Peça indisponível.",
+    )
+    with pytest.raises(IdempotencyKeyReuseError):
+        service.fail_service(failure_id, "OUTRO_MOTIVO", "Outra falha.")
+    with pytest.raises(TransitionNotAllowedError):
+        service.finish_service(message_id("finish-failed"), STARTED_AT)
+
+
 def test_lifecycle_emits_one_completion_after_every_service_and_reports_consumed_parts():
     lifecycle = ExecutionLifecycle(
         os_id=77,
@@ -170,6 +192,51 @@ def test_cancellation_marks_only_unfinished_services_and_reason_is_retained():
     assert lifecycle.service(4).status is ServiceStatus.CONCLUIDO
     assert lifecycle.service(5).status is ServiceStatus.CANCELADO
     assert lifecycle.cancellation_reason == "CANCELADO_PELO_CLIENTE"
+
+
+def test_lifecycle_emits_and_restores_failure_event():
+    lifecycle = ExecutionLifecycle(
+        77,
+        message_id("saga-failure"),
+        message_id("execution-failure"),
+        [4, 5],
+        reserved_parts=RESERVED,
+        budget_id=message_id("budget"),
+        start_message_id=message_id("start-command"),
+        request_id="request-failure",
+    )
+    lifecycle.start_service(4, message_id("start-failure"), STARTED_AT)
+
+    event = lifecycle.fail_service(
+        4,
+        message_id("fail-service"),
+        "SERVICO_INDISPONIVEL",
+        "Serviço indisponível.",
+    )
+
+    assert event is lifecycle.failure_event
+    assert event.execution_id == message_id("execution-failure")
+    assert event.budget_id == message_id("budget")
+    assert event.service_id == 4
+    assert event.error_code == "SERVICO_INDISPONIVEL"
+    assert event.error_message == "Serviço indisponível."
+    assert lifecycle.service(4).status is ServiceStatus.FALHOU
+    assert (
+        lifecycle.fail_service(
+            4,
+            message_id("fail-service"),
+            "SERVICO_INDISPONIVEL",
+            "Serviço indisponível.",
+        )
+        is None
+    )
+
+    restored = ExecutionLifecycle.from_state(lifecycle.to_state())
+    assert restored.failure_event == event
+    assert restored.service(4).failure_code == "SERVICO_INDISPONIVEL"
+    assert restored.start_message_id == message_id("start-command")
+    assert restored.request_id == "request-failure"
+    assert restored.service(5).status is ServiceStatus.PENDENTE
 
 
 @pytest.mark.parametrize(

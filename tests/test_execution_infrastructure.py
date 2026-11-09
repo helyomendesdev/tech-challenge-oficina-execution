@@ -187,6 +187,84 @@ def test_outbox_relay_recovers_pending_response_after_publish_failure(
     assert published["message_deduplication_id"] == pending.message["messageId"]
 
 
+def test_pre_execution_failure_is_published_from_outbox():
+    repository = InMemoryExecutionRepository()
+    command = start_message()
+    result = ExecuteCommandUseCase(repository).fail_execution_start(
+        command,
+        "PECA_SEM_ESTOQUE",
+        "Peca sem saldo para reserva.",
+        TRACE_ATTRIBUTES,
+    )
+    publisher = FakePublisher()
+
+    assert result.message_type == "ExecucaoFalhou"
+    assert repository.get_by_saga_id(command["sagaId"]) is None
+    assert OutboxRelay(repository, publisher).poll_once() == 1
+
+    published = publisher.messages[0]["message"]
+    assert published["type"] == "ExecucaoFalhou"
+    assert published["sagaId"] == command["sagaId"]
+    assert published["osId"] == command["osId"]
+    assert published["requestId"] == command["requestId"]
+    assert published["causationId"] == command["messageId"]
+    assert published["payload"] == {
+        "orcamentoId": command["payload"]["orcamentoId"],
+        "execucaoId": None,
+        "erro": {
+            "codigo": "PECA_SEM_ESTOQUE",
+            "mensagem": "Peca sem saldo para reserva.",
+        },
+    }
+
+
+def test_failed_execution_compensation_flows_through_sqs_consumer_and_outbox(
+    consumer_factory,
+):
+    command = start_message()
+    command["payload"]["servicos"].append({"servicoId": 10, "quantidade": 1})
+    sqs = FakeSQSClient(sqs_message(command))
+    consumer, repository = consumer_factory(sqs)
+    publisher = FakePublisher()
+    relay = OutboxRelay(repository, publisher)
+
+    assert consumer.poll_once() == 1
+    assert relay.poll_once() == 1
+
+    work = ExecutionWorkUseCase(repository)
+    work.start_service(command["sagaId"], 8)
+    failure = work.fail_service(
+        command["sagaId"],
+        8,
+        "SERVICO_INDISPONIVEL",
+        "Serviço indisponível.",
+    )
+    assert failure.outbox_message is not None
+    failure_message = failure.outbox_message.message
+    assert relay.poll_once() == 1
+    assert publisher.messages[-1]["message"] == failure_message
+
+    execution = repository.get_by_saga_id(command["sagaId"])
+    cancellation = cancel_message(command, execution.execution_id)
+    cancellation["causationId"] = failure_message["messageId"]
+    cancellation["payload"]["motivo"] = "EXECUCAO_FALHOU"
+    sqs.message = sqs_message(cancellation)
+
+    assert consumer.poll_once() == 1
+    assert relay.poll_once() == 1
+
+    cancelled_message = publisher.messages[-1]["message"]
+    assert cancelled_message["type"] == "ExecucaoCancelada"
+    assert cancelled_message["causationId"] == cancellation["messageId"]
+    assert cancelled_message["payload"] == {"execucaoId": execution.execution_id}
+
+    saved = repository.get_by_saga_id(command["sagaId"])
+    lifecycle, _version = repository.load_lifecycle(command["sagaId"])
+    assert saved.status.value == "CANCELADA"
+    assert lifecycle.service(8).status.value == "FALHOU"
+    assert lifecycle.service(10).status.value == "CANCELADO"
+
+
 def test_outbox_confirmation_failure_retries_with_same_response_id():
     class FailMarkOnceRepository(InMemoryExecutionRepository):
         def __init__(self):

@@ -19,11 +19,16 @@ from execution_service.domain.exceptions import (
     ConcurrentExecutionUpdateError,
     IdempotencyKeyReuseError,
     MessageValidationError,
+    TransitionNotAllowedError,
     UnsupportedMessageError,
 )
 from execution_service.domain.models import ExecutionRecord
 from execution_service.domain.policies import ExecutionStatusPolicy
-from execution_service.domain.service_execution import ExecutionLifecycle, PartConsumption
+from execution_service.domain.service_execution import (
+    ExecutionLifecycle,
+    PartConsumption,
+    validate_failure_details,
+)
 
 _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
@@ -258,6 +263,59 @@ class ExecuteCommandUseCase:
     def __init__(self, repository: ExecutionRepositoryPort):
         self.repository = repository
 
+    def fail_execution_start(
+        self,
+        body: dict[str, Any],
+        error_code: str,
+        error_message: str,
+        message_attributes: dict[str, Any] | None = None,
+    ) -> ExecutionResult:
+        command = ExecutionMessageValidator.validate(body, message_attributes)
+        if command.type != SagaMessageType.INICIAR_EXECUCAO.value:
+            raise MessageValidationError(
+                "Only IniciarExecucao can fail before an execution is created"
+            )
+        validate_failure_details(error_code, error_message)
+
+        body_fingerprint = _command_fingerprint(body)
+        existing_result = self._existing_result(command, body_fingerprint)
+        if existing_result is not None:
+            return existing_result
+        if self.repository.get_by_saga_id(command.saga_id) is not None:
+            raise TransitionNotAllowedError("Execution has already been accepted for this saga")
+
+        response = self._response(
+            command,
+            SagaMessageType.EXECUCAO_FALHOU.value,
+            {
+                "orcamentoId": command.payload["orcamentoId"],
+                "execucaoId": None,
+                "erro": {
+                    "codigo": error_code,
+                    "mensagem": error_message,
+                },
+            },
+            command.traceparent,
+            command.tracestate,
+        )
+        committed = self.repository.register_failure_response(
+            input_message_id=command.message_id,
+            input_fingerprint=body_fingerprint,
+            response=response,
+        )
+        if not committed:
+            duplicate = self._existing_result(command, body_fingerprint)
+            if duplicate is not None:
+                return duplicate
+            raise ConcurrentExecutionUpdateError(
+                "Concurrent command changed the execution state; retry the command"
+            )
+
+        outbox = self.repository.get_outbox(command.message_id)
+        if outbox is None:
+            raise RuntimeError(f"Outbox record missing for messageId={command.message_id}")
+        return self._result(None, outbox)
+
     def handle(
         self,
         body: dict[str, Any],
@@ -268,14 +326,7 @@ class ExecuteCommandUseCase:
             message_attributes,
         )
 
-        body_fingerprint = hashlib.sha256(
-            json.dumps(
-                body,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-        ).hexdigest()
+        body_fingerprint = _command_fingerprint(body)
 
         existing_result = self._existing_result(
             command,
@@ -386,26 +437,25 @@ class ExecuteCommandUseCase:
             raise RuntimeError(f"Outbox record missing for messageId={command.message_id}")
 
         record = self.repository.get_by_saga_id(command.saga_id)
-
-        if record is None:
+        if record is None and outbox.message.get("type") != SagaMessageType.EXECUCAO_FALHOU.value:
             raise RuntimeError(f"Execution record missing for sagaId={command.saga_id}")
 
         return self._result(record, outbox)
 
     @staticmethod
     def _result(
-        record: ExecutionRecord,
+        record: ExecutionRecord | None,
         outbox: OutboxMessage,
     ) -> ExecutionResult:
         return ExecutionResult(
-            status=record.status.value,
+            status=(record.status.value if record is not None else ExecutionStatus.FALHOU.value),
             message_type=outbox.message["type"],
             execution_id=outbox.message["payload"].get(
                 "execucaoId",
-                record.execution_id,
+                record.execution_id if record is not None else None,
             ),
-            saga_id=record.saga_id,
-            os_id=record.os_id,
+            saga_id=record.saga_id if record is not None else outbox.message["sagaId"],
+            os_id=record.os_id if record is not None else outbox.message["osId"],
             payload=outbox.message["payload"],
             message_id=outbox.message["messageId"],
         )
@@ -524,4 +574,18 @@ def _lifecycle_for(
         reserved_parts=reserved_parts,
         traceparent=command.traceparent,
         tracestate=command.tracestate,
+        budget_id=record.budget_id,
+        start_message_id=command.message_id,
+        request_id=command.request_id,
     )
+
+
+def _command_fingerprint(body: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()

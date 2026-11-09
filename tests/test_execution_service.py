@@ -8,7 +8,10 @@ import boto3
 import pytest
 
 from execution_service.app import create_aws_clients
-from execution_service.application.use_cases import ExecutionMessageValidator
+from execution_service.application.use_cases import (
+    ExecuteCommandUseCase,
+    ExecutionMessageValidator,
+)
 from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.exceptions import (
     IdempotencyKeyReuseError,
@@ -99,6 +102,65 @@ def test_start_command_persists_execution_and_contract_response(
     assert response_traceparent.split("-")[2] != TRACEPARENT.split("-")[2]
 
     assert pending.message_attributes["tracestate"]["StringValue"] == "vendor=value"
+
+
+def test_failure_before_execution_start_matches_v1_contract_and_is_idempotent():
+    repository = InMemoryExecutionRepository()
+    use_case = ExecuteCommandUseCase(repository)
+    command = start_message()
+
+    failed = use_case.fail_execution_start(
+        command,
+        "PECA_SEM_ESTOQUE",
+        "Peca 40 sem saldo para reserva.",
+        TRACE_ATTRIBUTES,
+    )
+    outbox = repository.get_outbox(command["messageId"])
+
+    assert failed.status == ExecutionStatus.FALHOU.value
+    assert failed.message_type == "ExecucaoFalhou"
+    assert failed.execution_id is None
+    assert repository.get_by_saga_id(command["sagaId"]) is None
+    assert outbox is not None
+    assert set(outbox.message) == {
+        "messageId",
+        "type",
+        "version",
+        "sagaId",
+        "osId",
+        "causationId",
+        "requestId",
+        "occurredAt",
+        "payload",
+    }
+    assert outbox.message["type"] == "ExecucaoFalhou"
+    assert outbox.message["version"] == 1
+    assert outbox.message["sagaId"] == command["sagaId"]
+    assert outbox.message["osId"] == command["osId"]
+    assert outbox.message["causationId"] == command["messageId"]
+    assert outbox.message["requestId"] == command["requestId"]
+    assert outbox.message["payload"] == {
+        "orcamentoId": command["payload"]["orcamentoId"],
+        "execucaoId": None,
+        "erro": {
+            "codigo": "PECA_SEM_ESTOQUE",
+            "mensagem": "Peca 40 sem saldo para reserva.",
+        },
+    }
+    assert "traceparent" not in outbox.message
+    assert "traceparent" in outbox.message_attributes
+
+    replay = use_case.fail_execution_start(
+        command,
+        "OUTRO_CODIGO",
+        "A resposta persistida deve prevalecer.",
+        TRACE_ATTRIBUTES,
+    )
+    handled_redelivery = use_case.handle(command, TRACE_ATTRIBUTES)
+    assert replay.message_id == outbox.message["messageId"]
+    assert handled_redelivery.message_id == outbox.message["messageId"]
+    assert handled_redelivery.message_type == "ExecucaoFalhou"
+    assert len(repository.outbox) == 1
 
 
 def test_application_composition_accepts_test_repository(

@@ -7,6 +7,7 @@ from execution_service.application.dto import (
     OutboxMessage,
     ServiceCommandReceipt,
 )
+from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.models import ExecutionRecord
 from execution_service.domain.service_execution import ExecutionLifecycle, ServiceStatus
 
@@ -33,6 +34,7 @@ class ServiceExecutionRepositoryPort(ABC):
         status: ServiceStatus,
         outbox_message: OutboxMessage | None,
         expected_version: int,
+        execution_status: ExecutionStatus | None = None,
     ) -> bool:
         """Atomically persist lifecycle, command receipt, and outbox when present."""
         raise NotImplementedError
@@ -58,6 +60,16 @@ class ExecutionRepositoryPort(ServiceExecutionRepositoryPort, ABC):
         lifecycle: ExecutionLifecycle | None = None,
         expected_lifecycle_version: int | None = None,
     ) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def register_failure_response(
+        self,
+        input_message_id: str,
+        input_fingerprint: str,
+        response: OutboxMessage,
+    ) -> bool:
+        """Atomically persist an IniciarExecucao failure response with no execution record."""
         raise NotImplementedError
 
     @abstractmethod

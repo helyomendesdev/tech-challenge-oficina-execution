@@ -14,12 +14,14 @@ _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 class ServiceStatus(str, Enum):
     PENDENTE = "PENDENTE"
     EM_EXECUCAO = "EM_EXECUCAO"
     CONCLUIDO = "CONCLUIDO"
+    FALHOU = "FALHOU"
     CANCELADO = "CANCELADO"
 
 
@@ -58,6 +60,26 @@ class ExecutionCompleted:
             raise MessageValidationError("type must be EXECUTION_COMPLETED")
 
 
+@dataclass(frozen=True)
+class ExecutionFailed:
+    os_id: int
+    saga_id: str
+    budget_id: str
+    execution_id: str | None
+    service_id: int
+    error_code: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        _positive_integer(self.os_id, "os_id")
+        _uuid(self.saga_id, "saga_id")
+        _uuid(self.budget_id, "budget_id")
+        if self.execution_id is not None:
+            _uuid(self.execution_id, "execution_id")
+        _positive_integer(self.service_id, "service_id")
+        validate_failure_details(self.error_code, self.error_message)
+
+
 class ServiceExecution:
     """Internal service lifecycle and consumption record."""
 
@@ -72,6 +94,9 @@ class ServiceExecution:
         "_consumption_commands",
         "_finish_message_id",
         "_finish_at",
+        "_failure_message_id",
+        "_failure_code",
+        "_failure_message",
         "_cancel_message_id",
     )
 
@@ -87,6 +112,9 @@ class ServiceExecution:
         self._consumption_commands: dict[str, tuple[PartConsumption, ...]] = {}
         self._finish_message_id: str | None = None
         self._finish_at: datetime | None = None
+        self._failure_message_id: str | None = None
+        self._failure_code: str | None = None
+        self._failure_message: str | None = None
         self._cancel_message_id: str | None = None
 
     @property
@@ -120,6 +148,14 @@ class ServiceExecution:
     @property
     def finish_at(self) -> datetime | None:
         return self._finish_at
+
+    @property
+    def failure_code(self) -> str | None:
+        return self._failure_code
+
+    @property
+    def failure_message(self) -> str | None:
+        return self._failure_message
 
     def has_consumption_command(self, message_id: str) -> bool:
         _uuid(message_id, "message_id")
@@ -204,11 +240,32 @@ class ServiceExecution:
         self._finish_at = completed_at
         return True
 
+    def fail_service(self, message_id: str, error_code: str, error_message: str) -> bool:
+        _uuid(message_id, "message_id")
+        validate_failure_details(error_code, error_message)
+
+        if message_id == self._failure_message_id:
+            if (error_code, error_message) != (self._failure_code, self._failure_message):
+                raise IdempotencyKeyReuseError(
+                    f"messageId={message_id} was reused with a different failure request"
+                )
+            return False
+        if self._status not in {ServiceStatus.PENDENTE, ServiceStatus.EM_EXECUCAO}:
+            raise TransitionNotAllowedError(
+                f"Cannot fail service while status is {self._status.value}"
+            )
+
+        self._status = ServiceStatus.FALHOU
+        self._failure_message_id = message_id
+        self._failure_code = error_code
+        self._failure_message = error_message
+        return True
+
     def cancel(self, message_id: str) -> bool:
         _uuid(message_id, "message_id")
         if message_id == self._cancel_message_id:
             return False
-        if self._status is ServiceStatus.CONCLUIDO:
+        if self._status in {ServiceStatus.CONCLUIDO, ServiceStatus.FALHOU}:
             return False
         if self._status is ServiceStatus.CANCELADO:
             return False
@@ -247,6 +304,9 @@ class ServiceExecution:
             ],
             "finishMessageId": self._finish_message_id,
             "cancelMessageId": self._cancel_message_id,
+            "failureMessageId": self._failure_message_id,
+            "failureCode": self._failure_code,
+            "failureMessage": self._failure_message,
         }
 
     @classmethod
@@ -285,6 +345,9 @@ class ServiceExecution:
         }
         service._finish_message_id = _state_optional_string(state.get("finishMessageId"))
         service._cancel_message_id = _state_optional_string(state.get("cancelMessageId"))
+        service._failure_message_id = _state_optional_string(state.get("failureMessageId"))
+        service._failure_code = _state_optional_string(state.get("failureCode"))
+        service._failure_message = _state_optional_string(state.get("failureMessage"))
         if service._started_at is not None:
             service._start_fingerprint = service._started_at
         if service._completed_at is not None:
@@ -305,7 +368,11 @@ class ExecutionLifecycle:
         "_execution_id",
         "_services",
         "_reserved_parts",
+        "_budget_id",
+        "_start_message_id",
+        "_request_id",
         "_completion_event",
+        "_failure_event",
         "_traceparent",
         "_tracestate",
         "_cancellation_reason",
@@ -320,6 +387,9 @@ class ExecutionLifecycle:
         reserved_parts: Sequence[PartConsumption] = (),
         traceparent: str | None = None,
         tracestate: str | None = None,
+        budget_id: str | None = None,
+        start_message_id: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         _positive_integer(os_id, "os_id")
         _uuid(saga_id, "saga_id")
@@ -340,6 +410,14 @@ class ExecutionLifecycle:
             raise MessageValidationError("reserved_parts must contain PartConsumption values")
         if tracestate is not None and traceparent is None:
             raise MessageValidationError("tracestate requires traceparent")
+        if budget_id is not None:
+            _uuid(budget_id, "budget_id")
+        if start_message_id is not None:
+            _uuid(start_message_id, "start_message_id")
+        if request_id is not None and (
+            not isinstance(request_id, str) or not 1 <= len(request_id) <= 128
+        ):
+            raise MessageValidationError("request_id must contain between 1 and 128 characters")
 
         self._os_id = os_id
         self._saga_id = saga_id
@@ -347,7 +425,11 @@ class ExecutionLifecycle:
         services = {service_id: ServiceExecution(service_id) for service_id in service_ids}
         self._services: Mapping[int, ServiceExecution] = MappingProxyType(services)
         self._reserved_parts = reserved_parts
+        self._budget_id = budget_id
+        self._start_message_id = start_message_id
+        self._request_id = request_id
         self._completion_event: ExecutionCompleted | None = None
+        self._failure_event: ExecutionFailed | None = None
         self._traceparent = traceparent
         self._tracestate = tracestate
         self._cancellation_reason: str | None = None
@@ -374,8 +456,24 @@ class ExecutionLifecycle:
         return self._completion_event
 
     @property
+    def failure_event(self) -> ExecutionFailed | None:
+        return self._failure_event
+
+    @property
     def reserved_parts(self) -> tuple[PartConsumption, ...]:
         return self._reserved_parts
+
+    @property
+    def budget_id(self) -> str | None:
+        return self._budget_id
+
+    @property
+    def start_message_id(self) -> str | None:
+        return self._start_message_id
+
+    @property
+    def request_id(self) -> str | None:
+        return self._request_id
 
     @property
     def traceparent(self) -> str | None:
@@ -407,11 +505,15 @@ class ExecutionLifecycle:
             reserved_parts=self._reserved_parts,
             traceparent=self._traceparent,
             tracestate=self._tracestate,
+            budget_id=self._budget_id,
+            start_message_id=self._start_message_id,
+            request_id=self._request_id,
         )
         clone._services = MappingProxyType(
             {service_id: service.clone() for service_id, service in self._services.items()}
         )
         clone._completion_event = self._completion_event
+        clone._failure_event = self._failure_event
         clone._cancellation_reason = self._cancellation_reason
         return clone
 
@@ -421,6 +523,7 @@ class ExecutionLifecycle:
         message_id: str,
         started_at: datetime,
     ) -> bool:
+        self._ensure_not_failed()
         return self.service(service_id).request_service_start(
             message_id,
             started_at,
@@ -432,6 +535,7 @@ class ExecutionLifecycle:
         message_id: str,
         parts: Sequence[PartConsumption],
     ) -> bool:
+        self._ensure_not_failed()
         service = self.service(service_id)
         if isinstance(parts, (str, bytes)) or not isinstance(parts, Sequence):
             raise MessageValidationError("parts must be a sequence of PartConsumption values")
@@ -448,6 +552,7 @@ class ExecutionLifecycle:
         message_id: str,
         completed_at: datetime,
     ) -> ExecutionCompleted | None:
+        self._ensure_not_failed()
         service = self.service(service_id)
         if not service.finish_service(message_id, completed_at):
             return None
@@ -464,6 +569,37 @@ class ExecutionLifecycle:
             )
             return self._completion_event
         return None
+
+    def fail_service(
+        self,
+        service_id: int,
+        message_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> ExecutionFailed | None:
+        service = self.service(service_id)
+        if self._failure_event is not None and service_id != self._failure_event.service_id:
+            raise TransitionNotAllowedError("Execution has already failed")
+        if self._failure_event is None and (
+            self._budget_id is None or self._start_message_id is None or self._request_id is None
+        ):
+            raise MessageValidationError(
+                "Execution lifecycle is missing failure event correlation data"
+            )
+        if not service.fail_service(message_id, error_code, error_message):
+            return None
+
+        if self._failure_event is None:
+            self._failure_event = ExecutionFailed(
+                os_id=self._os_id,
+                saga_id=self._saga_id,
+                budget_id=self._budget_id,
+                execution_id=self._execution_id,
+                service_id=service_id,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        return self._failure_event
 
     def cancel(self, message_id: str, reason: str) -> None:
         _uuid(message_id, "message_id")
@@ -485,8 +621,20 @@ class ExecutionLifecycle:
                 }
                 for part in self._reserved_parts
             ],
+            "budgetId": self._budget_id,
+            "startMessageId": self._start_message_id,
+            "requestId": self._request_id,
             "completedAt": (
                 self._completion_event.completed_at.isoformat() if self._completion_event else None
+            ),
+            "failureEvent": (
+                {
+                    "serviceId": self._failure_event.service_id,
+                    "errorCode": self._failure_event.error_code,
+                    "errorMessage": self._failure_event.error_message,
+                }
+                if self._failure_event
+                else None
             ),
             "traceparent": self._traceparent,
             "tracestate": self._tracestate,
@@ -518,6 +666,9 @@ class ExecutionLifecycle:
                 )
                 for item in reserved
             ],
+            budget_id=_state_optional_string(state.get("budgetId")),
+            start_message_id=_state_optional_string(state.get("startMessageId")),
+            request_id=_state_optional_string(state.get("requestId")),
             traceparent=_state_optional_string(state.get("traceparent")),
             tracestate=_state_optional_string(state.get("tracestate")),
         )
@@ -537,8 +688,36 @@ class ExecutionLifecycle:
                 completed_at=completed_at,
                 parts_consumed=lifecycle._consumed_parts_for_contract(),
             )
+        failure_event = state.get("failureEvent")
+        if failure_event is not None:
+            if not isinstance(failure_event, dict):
+                raise MessageValidationError("Persisted failure event must be an object")
+            budget_id = lifecycle._budget_id
+            if budget_id is None:
+                raise MessageValidationError(
+                    "Persisted failure event requires the lifecycle budget_id"
+                )
+            error_message = _state_optional_string(failure_event.get("errorMessage"))
+            error_code = _state_optional_string(failure_event.get("errorCode"))
+            if error_message is None or error_code is None:
+                raise MessageValidationError(
+                    "Persisted failure event requires errorCode and errorMessage strings"
+                )
+            lifecycle._failure_event = ExecutionFailed(
+                os_id=lifecycle._os_id,
+                saga_id=lifecycle._saga_id,
+                budget_id=budget_id,
+                execution_id=lifecycle._execution_id,
+                service_id=_state_integer(failure_event["serviceId"], "serviceId"),
+                error_code=error_code,
+                error_message=error_message,
+            )
         lifecycle._cancellation_reason = _state_optional_string(state.get("cancellationReason"))
         return lifecycle
+
+    def _ensure_not_failed(self) -> None:
+        if self._failure_event is not None:
+            raise TransitionNotAllowedError("Execution has already failed")
 
     def _validate_reserved_consumption(
         self,
@@ -619,6 +798,15 @@ def _state_optional_string(value: object) -> str | None:
 def _positive_integer(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise MessageValidationError(f"{name} must be a positive integer")
+
+
+def validate_failure_details(error_code: str, error_message: str) -> None:
+    if not isinstance(error_code, str) or not _ERROR_CODE.fullmatch(error_code):
+        raise MessageValidationError(
+            "error_code must start with an uppercase letter and contain only A-Z, 0-9 or _"
+        )
+    if not isinstance(error_message, str) or not error_message.strip() or len(error_message) > 500:
+        raise MessageValidationError("error_message must contain between 1 and 500 characters")
 
 
 def _uuid(value: str, name: str) -> None:

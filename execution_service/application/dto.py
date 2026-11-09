@@ -33,7 +33,7 @@ class ExecutionEnvelope:
 class ExecutionResult:
     status: str
     message_type: str
-    execution_id: str
+    execution_id: str | None
     saga_id: str
     os_id: int
     traceparent: str | None = None
@@ -58,12 +58,17 @@ class ServiceExecutionCommandContext:
     request_id: str
     traceparent: str | None = None
     tracestate: str | None = None
+    causation_id: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("saga_id", "execution_id", "message_id"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not _UUID.fullmatch(value):
                 raise MessageValidationError(f"{field_name} must be a lowercase RFC 4122 UUID")
+        if self.causation_id is not None and (
+            not isinstance(self.causation_id, str) or not _UUID.fullmatch(self.causation_id)
+        ):
+            raise MessageValidationError("causation_id must be a lowercase RFC 4122 UUID")
         if isinstance(self.os_id, bool) or not isinstance(self.os_id, int) or self.os_id < 1:
             raise MessageValidationError("os_id must be a positive integer")
         if not isinstance(self.request_id, str) or not 1 <= len(self.request_id) <= 128:

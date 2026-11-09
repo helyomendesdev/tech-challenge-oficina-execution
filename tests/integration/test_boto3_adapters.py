@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import boto3
 from botocore.stub import Stubber
 
 from execution_service.application.dto import OutboxMessage
+from execution_service.domain.enums import ExecutionStatus
 from execution_service.domain.service_execution import (
     ExecutionLifecycle,
     PartConsumption,
@@ -97,6 +99,51 @@ def test_dynamodb_repository_uses_atomic_transaction_and_pending_outbox_index():
         assert len(captured[0]["TransactItems"]) == 4
         assert all("Put" in operation for operation in captured[0]["TransactItems"])
         assert repository.get_pending_outbox() == []
+        stubber.assert_no_pending_responses()
+
+
+def test_dynamodb_pre_execution_failure_commits_inbox_and_outbox_without_execution():
+    client = boto_client("dynamodb")
+    repository = DynamoDBExecutionRepository("execution-service-test", client)
+    source = outbox_message()
+    command_id = source.message["messageId"]
+    response = OutboxMessage(
+        message={
+            **source.message,
+            "type": "ExecucaoFalhou",
+            "causationId": command_id,
+            "payload": {
+                "orcamentoId": str(uuid4()),
+                "execucaoId": None,
+                "erro": {
+                    "codigo": "PECA_SEM_ESTOQUE",
+                    "mensagem": "Peca sem saldo.",
+                },
+            },
+        },
+        message_attributes=source.message_attributes,
+    )
+    captured = []
+    client.meta.events.register_first(
+        "before-parameter-build.dynamodb.TransactWriteItems",
+        lambda params, **_kwargs: captured.append(params),
+    )
+
+    with Stubber(client) as stubber:
+        stubber.add_response("transact_write_items", {})
+        assert repository.register_failure_response(
+            command_id,
+            "input-fingerprint",
+            response,
+        )
+        operations = captured[0]["TransactItems"]
+        assert len(operations) == 3
+        assert operations[0]["Put"]["ConditionExpression"] == "attribute_not_exists(pk)"
+        assert operations[1]["Put"]["ConditionExpression"] == "attribute_not_exists(pk)"
+        assert operations[2]["ConditionCheck"]["ConditionExpression"] == "attribute_not_exists(pk)"
+        persisted = repository._deserialize_item(operations[1]["Put"]["Item"])
+        assert persisted["message"]["type"] == "ExecucaoFalhou"
+        assert persisted["message"]["payload"]["execucaoId"] is None
         stubber.assert_no_pending_responses()
 
 
@@ -195,4 +242,101 @@ def test_dynamodb_service_completion_commits_lifecycle_receipt_execution_and_out
             repository._deserialize_item(operations[3]["Put"]["Item"])["message"]["payload"]
             == response.message["payload"]
         )
+        stubber.assert_no_pending_responses()
+
+
+def test_dynamodb_service_failure_commits_failed_status_and_outbox_together():
+    client = boto_client("dynamodb")
+    repository = DynamoDBExecutionRepository("execution-service-test", client)
+    record = execution_record()
+    lifecycle = ExecutionLifecycle(
+        os_id=record.os_id,
+        saga_id=record.saga_id,
+        execution_id=record.execution_id,
+        service_ids=[2],
+        budget_id=record.budget_id,
+        start_message_id="a122f6d5-6dca-49d2-b94e-5e8a9ab9499a",
+        request_id="request-failure",
+    )
+    lifecycle.start_service(
+        2,
+        "a122f6d5-6dca-49d2-b94e-5e8a9ab9499c",
+        datetime(2026, 11, 1, 10, tzinfo=timezone.utc),
+    )
+    lifecycle.fail_service(
+        2,
+        "a122f6d5-6dca-49d2-b94e-5e8a9ab9499b",
+        "FALHA_NO_SERVICO",
+        "Falha durante o serviço.",
+    )
+    source = outbox_message()
+    response = OutboxMessage(
+        message={
+            **source.message,
+            "type": "ExecucaoFalhou",
+            "sagaId": record.saga_id,
+            "osId": record.os_id,
+            "causationId": lifecycle.start_message_id,
+            "requestId": lifecycle.request_id,
+            "payload": {
+                "orcamentoId": record.budget_id,
+                "execucaoId": record.execution_id,
+                "erro": {
+                    "codigo": "FALHA_NO_SERVICO",
+                    "mensagem": "Falha durante o serviço.",
+                },
+            },
+        },
+        message_attributes=source.message_attributes,
+    )
+    command_id = "a122f6d5-6dca-49d2-b94e-5e8a9ab9499b"
+    captured = []
+    client.meta.events.register_first(
+        "before-parameter-build.dynamodb.TransactWriteItems",
+        lambda params, **_kwargs: captured.append(params),
+    )
+
+    with Stubber(client) as stubber:
+        stubber.add_response(
+            "get_item",
+            {
+                "Item": repository._serialize_item(
+                    repository._lifecycle_item(record.saga_id, lifecycle, 4)
+                )
+            },
+            {
+                "TableName": "execution-service-test",
+                "Key": repository._serialize_item(
+                    {"pk": f"EXEC#{record.saga_id}", "sk": "LIFECYCLE"}
+                ),
+                "ConsistentRead": True,
+            },
+        )
+        stubber.add_response(
+            "get_item",
+            {"Item": repository._serialize_item(repository._record_item(record))},
+            {
+                "TableName": "execution-service-test",
+                "Key": repository._serialize_item({"pk": f"EXEC#{record.saga_id}", "sk": "RECORD"}),
+                "ConsistentRead": True,
+            },
+        )
+        stubber.add_response("transact_write_items", {})
+
+        assert repository.commit_service_command(
+            lifecycle,
+            command_id,
+            "failure-fingerprint",
+            ServiceStatus.FALHOU,
+            response,
+            expected_version=4,
+            execution_status=ExecutionStatus.FALHOU,
+        )
+        operations = captured[0]["TransactItems"]
+        record_item = repository._deserialize_item(operations[2]["Put"]["Item"])
+        outbox_item = repository._deserialize_item(operations[3]["Put"]["Item"])
+        assert len(operations) == 4
+        assert record_item["status"] == ExecutionStatus.FALHOU.value
+        assert outbox_item["message"]["type"] == "ExecucaoFalhou"
+        assert outbox_item["message"]["payload"] == response.message["payload"]
         stubber.assert_no_pending_responses()

@@ -15,7 +15,7 @@ from execution_service.application.dto import (
 )
 from execution_service.application.ports import ServiceExecutionRepositoryPort
 from execution_service.application.use_cases import _child_traceparent
-from execution_service.domain.enums import SagaMessageType
+from execution_service.domain.enums import ExecutionStatus, SagaMessageType
 from execution_service.domain.exceptions import (
     ConcurrentExecutionUpdateError,
     IdempotencyKeyReuseError,
@@ -23,6 +23,7 @@ from execution_service.domain.exceptions import (
 )
 from execution_service.domain.service_execution import (
     ExecutionCompleted,
+    ExecutionFailed,
     ExecutionLifecycle,
     PartConsumption,
 )
@@ -39,7 +40,7 @@ class _ServiceExecutionUseCase:
         context: ServiceExecutionCommandContext,
         operation: str,
         inputs: dict[str, Any],
-        change: Callable[[ExecutionLifecycle], ExecutionCompleted | None],
+        change: Callable[[ExecutionLifecycle], ExecutionCompleted | ExecutionFailed | None],
     ) -> ServiceExecutionResult:
         fingerprint = _fingerprint(
             {
@@ -69,7 +70,12 @@ class _ServiceExecutionUseCase:
 
             event = change(lifecycle)
             status = lifecycle.service(inputs["serviceId"]).status
-            outbox = _completion_outbox(context, event) if event is not None else None
+            outbox = _service_event_outbox(context, event) if event is not None else None
+            execution_status = None
+            if isinstance(event, ExecutionFailed):
+                execution_status = ExecutionStatus.FALHOU
+            elif event is not None:
+                execution_status = ExecutionStatus.CONCLUIDA
             try:
                 committed = self._repository.commit_service_command(
                     lifecycle=lifecycle,
@@ -78,6 +84,7 @@ class _ServiceExecutionUseCase:
                     status=status,
                     outbox_message=outbox,
                     expected_version=version,
+                    execution_status=execution_status,
                 )
             except ConcurrentExecutionUpdateError:
                 continue
@@ -205,6 +212,34 @@ class FinishServiceUseCase(_ServiceExecutionUseCase):
         )
 
 
+class FailServiceUseCase(_ServiceExecutionUseCase):
+    def execute(
+        self,
+        context: ServiceExecutionCommandContext,
+        service_id: int,
+        error_code: str,
+        error_message: str,
+    ) -> ServiceExecutionResult:
+        def change(lifecycle: ExecutionLifecycle) -> ExecutionFailed | None:
+            return lifecycle.fail_service(
+                service_id,
+                context.message_id,
+                error_code,
+                error_message,
+            )
+
+        return self._execute(
+            context,
+            "FAIL_SERVICE",
+            {
+                "serviceId": service_id,
+                "errorCode": error_code,
+                "errorMessage": error_message,
+            },
+            change,
+        )
+
+
 class ExecutionWorkUseCase:
     """Internal application entry point used by execution workers and integration tests."""
 
@@ -213,6 +248,7 @@ class ExecutionWorkUseCase:
         self._start = StartServiceUseCase(repository)
         self._record_consumption = RecordServiceConsumptionUseCase(repository)
         self._finish = FinishServiceUseCase(repository)
+        self._fail = FailServiceUseCase(repository)
 
     def start_service(
         self,
@@ -262,6 +298,19 @@ class ExecutionWorkUseCase:
             completed_at or datetime.now(timezone.utc),
         )
 
+    def fail_service(
+        self,
+        saga_id: str,
+        service_id: int,
+        error_code: str,
+        error_message: str,
+        *,
+        request_id: str = "execution-internal",
+        message_id: str | None = None,
+    ) -> ServiceExecutionResult:
+        context = self._context(saga_id, request_id, message_id)
+        return self._fail.execute(context, service_id, error_code, error_message)
+
     def _context(
         self,
         saga_id: str,
@@ -277,7 +326,8 @@ class ExecutionWorkUseCase:
             execution_id=lifecycle.execution_id,
             os_id=lifecycle.os_id,
             message_id=message_id or str(uuid4()),
-            request_id=request_id,
+            request_id=lifecycle.request_id or request_id,
+            causation_id=lifecycle.start_message_id,
             traceparent=lifecycle.traceparent,
             tracestate=lifecycle.tracestate,
         )
@@ -294,9 +344,9 @@ def _datetime_input(value: datetime) -> str:
     return value.isoformat()
 
 
-def _completion_outbox(
+def _service_event_outbox(
     context: ServiceExecutionCommandContext,
-    event: ExecutionCompleted,
+    event: ExecutionCompleted | ExecutionFailed,
 ) -> OutboxMessage:
     traceparent = _child_traceparent(context.traceparent)
     attributes = {
@@ -310,28 +360,44 @@ def _completion_outbox(
             "DataType": "String",
             "StringValue": context.tracestate,
         }
+    if context.causation_id is None:
+        raise MessageValidationError(
+            "Execution lifecycle has no causation_id for its Saga response"
+        )
 
-    payload: dict[str, Any] = {
-        "execucaoId": event.execution_id,
-        "finalizadaEm": event.completed_at.isoformat(),
-    }
-    if event.parts_consumed is not None:
-        payload["pecasConsumidas"] = [
-            {
-                "itemPecaOSId": part.item_peca_os_id,
-                "pecaId": part.peca_id,
-                "quantidade": part.quantity,
-            }
-            for part in event.parts_consumed
-        ]
+    if isinstance(event, ExecutionFailed):
+        message_type = SagaMessageType.EXECUCAO_FALHOU.value
+        payload: dict[str, Any] = {
+            "orcamentoId": event.budget_id,
+            "execucaoId": event.execution_id,
+            "erro": {
+                "codigo": event.error_code,
+                "mensagem": event.error_message,
+            },
+        }
+    else:
+        message_type = SagaMessageType.EXECUCAO_FINALIZADA.value
+        payload = {
+            "execucaoId": event.execution_id,
+            "finalizadaEm": event.completed_at.isoformat(),
+        }
+        if event.parts_consumed is not None:
+            payload["pecasConsumidas"] = [
+                {
+                    "itemPecaOSId": part.item_peca_os_id,
+                    "pecaId": part.peca_id,
+                    "quantidade": part.quantity,
+                }
+                for part in event.parts_consumed
+            ]
     return OutboxMessage(
         message={
             "messageId": str(uuid4()),
-            "type": SagaMessageType.EXECUCAO_FINALIZADA.value,
+            "type": message_type,
             "version": 1,
             "sagaId": event.saga_id,
             "osId": event.os_id,
-            "causationId": context.message_id,
+            "causationId": context.causation_id,
             "requestId": context.request_id,
             "occurredAt": datetime.now(timezone.utc).isoformat(),
             "payload": payload,

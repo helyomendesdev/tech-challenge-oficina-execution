@@ -92,6 +92,34 @@ class InMemoryExecutionRepository(ExecutionRepositoryPort):
                 self._lifecycles[record.saga_id] = (lifecycle.clone(), version)
             return True
 
+    def register_failure_response(
+        self,
+        input_message_id: str,
+        input_fingerprint: str,
+        response: OutboxMessage,
+    ) -> bool:
+        with self._lock:
+            previous = self.fingerprints.get(input_message_id)
+            if previous is not None:
+                if previous != input_fingerprint:
+                    raise IdempotencyKeyReuseError(
+                        f"messageId={input_message_id} was reused with a different body"
+                    )
+                return False
+
+            saga_id = response.message["sagaId"]
+            if saga_id in self.records:
+                raise ConcurrentExecutionUpdateError(
+                    "Execution has already been accepted for this saga"
+                )
+
+            self.fingerprints[input_message_id] = input_fingerprint
+            self.outbox[input_message_id] = replace(
+                deepcopy(response),
+                input_message_id=input_message_id,
+            )
+            return True
+
     def get_outbox(self, input_message_id: str) -> OutboxMessage | None:
         with self._lock:
             message = self.outbox.get(input_message_id)
@@ -131,6 +159,7 @@ class InMemoryExecutionRepository(ExecutionRepositoryPort):
         status: ServiceStatus,
         outbox_message: OutboxMessage | None,
         expected_version: int,
+        execution_status: ExecutionStatus | None = None,
     ) -> bool:
         with self._lock:
             previous = self._service_receipts.get(message_id)
@@ -165,7 +194,7 @@ class InMemoryExecutionRepository(ExecutionRepositoryPort):
                 outbox_message=persisted_outbox,
             )
             if persisted_outbox is not None:
-                record.status = ExecutionStatus.CONCLUIDA
+                record.status = execution_status or ExecutionStatus.CONCLUIDA
                 record.updated_at = datetime.now(timezone.utc)
                 record.version += 1
                 self.outbox[message_id] = persisted_outbox

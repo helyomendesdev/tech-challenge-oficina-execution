@@ -164,6 +164,56 @@ def test_finishing_one_service_does_not_finalize_execution(execution):
     assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.EM_EXECUCAO
 
 
+def test_failing_service_emits_execucao_falhou_and_marks_execution_failed(execution):
+    repository, command, _result, work = execution
+    work.start_service(command["sagaId"], 101, started_at=STARTED_AT)
+    failure_id = str(uuid4())
+
+    failed = work.fail_service(
+        command["sagaId"],
+        101,
+        "SERVICO_INDISPONIVEL",
+        "Serviço indisponível.",
+        message_id=failure_id,
+    )
+    saved = repository.get_by_saga_id(command["sagaId"])
+    lifecycle, version = repository.load_lifecycle(command["sagaId"])
+    outbox = failed.outbox_message
+
+    assert failed.status is ServiceStatus.FALHOU
+    assert not failed.duplicate
+    assert outbox is not None
+    assert outbox.message["type"] == "ExecucaoFalhou"
+    assert outbox.message["payload"] == {
+        "orcamentoId": command["payload"]["orcamentoId"],
+        "execucaoId": saved.execution_id,
+        "erro": {
+            "codigo": "SERVICO_INDISPONIVEL",
+            "mensagem": "Serviço indisponível.",
+        },
+    }
+    assert outbox.message["causationId"] == command["messageId"]
+    assert outbox.message["requestId"] == command["requestId"]
+    assert saved.status is ExecutionStatus.FALHOU
+    assert lifecycle.service(101).status is ServiceStatus.FALHOU
+    assert lifecycle.service(102).status is ServiceStatus.PENDENTE
+    assert lifecycle.failure_event.error_code == "SERVICO_INDISPONIVEL"
+    assert lifecycle.failure_event.error_message == "Serviço indisponível."
+    assert version == 2
+    assert repository.get_service_command_receipt(failure_id).outbox_message == outbox
+
+    replay = work.fail_service(
+        command["sagaId"],
+        101,
+        "SERVICO_INDISPONIVEL",
+        "Serviço indisponível.",
+        message_id=failure_id,
+    )
+    assert replay.duplicate
+    assert replay.outbox_message.message["messageId"] == outbox.message["messageId"]
+    assert len(repository.get_pending_outbox()) == 2
+
+
 def test_last_service_emits_execucao_finalizada_once_with_aggregated_consumption(execution):
     repository, command, _result, work = execution
     first_part = (PartConsumption(501, 10, 2),)
@@ -192,6 +242,8 @@ def test_last_service_emits_execucao_finalizada_once_with_aggregated_consumption
 
     assert outbox is not None
     assert outbox.message["type"] == "ExecucaoFinalizada"
+    assert outbox.message["causationId"] == command["messageId"]
+    assert outbox.message["requestId"] == command["requestId"]
     assert outbox.message["version"] == 1
     assert outbox.message["payload"] == {
         "execucaoId": execution_id,
@@ -306,9 +358,15 @@ def test_cancellation_stops_unfinished_services_and_releases_via_contract_respon
 
 
 def test_cancellation_after_failure_is_supported_and_idempotent(execution):
-    repository, command, _result, _work = execution
-    record = repository.records[command["sagaId"]]
-    record.status = ExecutionStatus.FALHOU
+    repository, command, _result, work = execution
+    work.start_service(command["sagaId"], 101, started_at=STARTED_AT)
+    work.fail_service(
+        command["sagaId"],
+        101,
+        "SERVICO_INDISPONIVEL",
+        "Serviço indisponível.",
+    )
+    record = repository.get_by_saga_id(command["sagaId"])
     cancellation = {
         **command,
         "messageId": str(uuid4()),
@@ -326,6 +384,9 @@ def test_cancellation_after_failure_is_supported_and_idempotent(execution):
     assert result.message_type == "ExecucaoCancelada"
     assert replay.message_id == result.message_id
     assert repository.get_by_saga_id(command["sagaId"]).status is ExecutionStatus.CANCELADA
+    lifecycle, _version = repository.load_lifecycle(command["sagaId"])
+    assert lifecycle.service(101).status is ServiceStatus.FALHOU
+    assert lifecycle.service(102).status is ServiceStatus.CANCELADO
 
 
 def test_v11_item_peca_os_id_is_optional_for_legacy_start_messages():

@@ -171,6 +171,7 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
         status: ServiceStatus,
         outbox_message: OutboxMessage | None,
         expected_version: int,
+        execution_status: ExecutionStatus | None = None,
     ) -> bool:
         lifecycle_key = {"pk": f"EXEC#{lifecycle.saga_id}", "sk": "LIFECYCLE"}
         stored_lifecycle = self._get_item(
@@ -238,7 +239,7 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                 }
             )
         else:
-            record.status = ExecutionStatus.CONCLUIDA
+            record.status = execution_status or ExecutionStatus.CONCLUIDA
             record.updated_at = datetime.now(timezone.utc)
             record.version += 1
             operations.append(
@@ -285,6 +286,65 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                 return False
             raise ConcurrentExecutionUpdateError(
                 "Concurrent service execution state change; retry the command"
+            ) from exc
+        return True
+
+    def register_failure_response(
+        self,
+        input_message_id: str,
+        input_fingerprint: str,
+        response: OutboxMessage,
+    ) -> bool:
+        message_key = f"MSG#{input_message_id}"
+        saga_id = response.message["sagaId"]
+        operations = [
+            {
+                "Put": {
+                    "TableName": self.table_name,
+                    "Item": self._serialize_item(
+                        {
+                            "pk": message_key,
+                            "sk": "IDEMPOTENCY",
+                            "entity_type": "IDEMPOTENCY",
+                            "input_fingerprint": input_fingerprint,
+                            "saga_id": saga_id,
+                        }
+                    ),
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.table_name,
+                    "Item": self._serialize_item(self._outbox_item(input_message_id, response)),
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+            {
+                "ConditionCheck": {
+                    "TableName": self.table_name,
+                    "Key": self._serialize_item({"pk": f"EXEC#{saga_id}", "sk": "RECORD"}),
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+        ]
+        try:
+            self.client.transact_write_items(TransactItems=operations)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") not in {
+                "TransactionCanceledException",
+                "ConditionalCheckFailedException",
+            }:
+                raise
+            previous = self.get_input_fingerprint(input_message_id)
+            if previous is not None:
+                if previous != input_fingerprint:
+                    raise IdempotencyKeyReuseError(
+                        f"messageId={input_message_id} was reused with a different body"
+                    ) from exc
+                return False
+            raise ConcurrentExecutionUpdateError(
+                "Execution has already been accepted for this saga"
             ) from exc
         return True
 

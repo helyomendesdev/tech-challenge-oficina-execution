@@ -17,8 +17,9 @@ Fontes consultadas na tag v1.1.0 de
 - `tracing/propagacao-sqs.md`
 
 O Execution recebe `IniciarExecucao` e `CancelarExecucao` e responde com
-`ExecucaoIniciada`, `ExecucaoFinalizada` ou `ExecucaoCancelada`. O início e a
-finalização de cada serviço são operações internas, não mensagens da Saga.
+`ExecucaoIniciada`, `ExecucaoFinalizada`, `ExecucaoFalhou` ou
+`ExecucaoCancelada`. O início e a finalização de cada serviço são operações
+internas, não mensagens da Saga.
 `itemPecaOSId` é opcional em `IniciarExecucao.pecas[]`; quando disponível, o
 Execution rastreia o consumo por reserva e inclui `pecasConsumidas[]` em
 `ExecucaoFinalizada` conforme o formato v1.1.0.
@@ -64,9 +65,11 @@ automaticamente a DLQ.
 - O Execution persiste a compensação local e emite `ExecucaoCancelada`. A
   liberação física das reservas continua pertencendo ao serviço dono do estoque
   (OS Service); este repositório não acessa o banco de outro serviço.
-- Não há worker/critério operacional que gere `ExecucaoFalhou`; a execução
-  aceita esse estado persistido para processar o `CancelarExecucao` de
-  compensação conforme a Saga.
+- Não há worker que detecte automaticamente falhas mecânicas. A aplicação pode
+  registrar uma falha antes da criação da execução por
+  `ExecuteCommandUseCase.fail_execution_start` ou uma falha interna por
+  `ExecutionWorkUseCase.fail_service`; ambas emitem `ExecucaoFalhou` conforme
+  o contrato v1.1.
 - A fila compartilhada de respostas é fornecida por ARN e não é criada pelo
   Terraform deste repositório.
 - O relay é pelo menos uma vez: se o envio ao SQS ocorrer e a confirmação da
@@ -76,14 +79,16 @@ automaticamente a DLQ.
 
 ## Ciclo interno dos serviços
 
-`ExecutionWorkUseCase` expõe `start_service`, `record_consumption` e
-`finish_service` à camada de aplicação; não foi criada rota HTTP nem mensagem
-por serviço. A aplicação inicia o serviço e registra a data, registra em
-operação idempotente as peças e quantidades efetivamente consumidas (validando
-contra as reservas), e então registra a conclusão. Só a conclusão do último
-serviço cria `ExecucaoFinalizada`. `pecasConsumidas` é agregado por
-`itemPecaOSId` e a transição final é persistida junto com o estado, recibo
-idempotente e Outbox.
+`ExecutionWorkUseCase` expõe `start_service`, `record_consumption`,
+`finish_service` e `fail_service` à camada de aplicação; não foi criada rota
+HTTP nem mensagem por serviço. A aplicação inicia o serviço e registra a data,
+registra em operação idempotente as peças e quantidades efetivamente
+consumidas (validando contra as reservas), e então conclui ou falha o serviço.
+Só a conclusão do último serviço cria `ExecucaoFinalizada`. `fail_service`
+registra atomicamente a execução como `FALHOU` e emite `ExecucaoFalhou`; a
+compensação posterior por `CancelarExecucao` preserva o estado `FALHOU` do
+serviço. `pecasConsumidas` é agregado por `itemPecaOSId` e a transição final é
+persistida junto com o estado, recibo idempotente e Outbox.
 
 O agregado dos serviços é criado atomicamente com `IniciarExecucao`,
 `ExecucaoIniciada`, Inbox e Outbox. DynamoDB usa transações e controle otimista
@@ -92,7 +97,9 @@ finalização quando outro serviço vence primeiro a disputa.
 
 `CancelarExecucao` registra o motivo, cancela serviços não concluídos e persiste
 `ExecucaoCancelada` na mesma transação que a Inbox/Outbox. Também aceita uma
-execução no estado `FALHOU`. O contrato de resposta contém somente `execucaoId`;
+execução no estado `FALHOU`; o comando é uma solicitação de cancelamento, não um
+gatilho para gerar `ExecucaoFalhou`, e preserva o serviço que já falhou. O
+contrato de resposta contém somente `execucaoId`;
 a liberação das reservas é responsabilidade do OS Service, proprietário dessa
 compensação, e não é simulada por acesso ao banco de outro serviço.
 
@@ -129,6 +136,12 @@ docker exec execution-service python -m execution_service.cli record-consumption
 docker exec execution-service python -m execution_service.cli finish-service \
   --saga-id 11111111-1111-4111-8111-111111111111 \
   --service-id 101
+
+docker exec execution-service python -m execution_service.cli fail-service \
+  --saga-id 11111111-1111-4111-8111-111111111111 \
+  --service-id 101 \
+  --error-code SERVICO_INDISPONIVEL \
+  --error-message "Serviço indisponível."
 ```
 
 O `saga-id` é o `sagaId` da execução; `service-id` é o `servicoId` da
@@ -154,6 +167,8 @@ python -m execution_service.cli record-consumption --saga-id UUID --service-id I
     [--request-id ID] [--message-id UUID]
 python -m execution_service.cli finish-service --saga-id UUID --service-id ID
     [--completed-at ISO_DATETIME] [--request-id ID] [--message-id UUID]
+python -m execution_service.cli fail-service --saga-id UUID --service-id ID
+    --error-code CODE --error-message MESSAGE [--request-id ID] [--message-id UUID]
 ```
 
 Cada comando válido escreve uma única resposta JSON. Sucesso vai para stdout,
@@ -171,12 +186,18 @@ inválidos vão para stderr no mesmo formato, com código `2` e
 Não há comando para concluir a execução global: o caso de uso conclui a execução
 automaticamente ao finalizar o último serviço, persiste `ExecucaoFinalizada` na
 Outbox e a resposta desse comando contém `"executionCompleted": true` e
-`"outboxMessageType": "ExecucaoFinalizada"`. Também não há comando de falha de
-serviço: o domínio e os casos de uso não implementam falha individual (o estado
-`FALHOU` existente é da execução, não do serviço). A menor extensão exige modelar
-essa transição no domínio/caso de uso e persistir atomicamente o estado e a
-mensagem de falha na Outbox; antes disso é necessário conferir o payload exato
-previsto pelo contrato v1.1.0. A CLI não cria uma mensagem nova para a Saga.
+`"outboxMessageType": "ExecucaoFinalizada"`. `fail-service` registra a falha de
+um serviço em execução, altera o estado global para `FALHOU` e persiste
+`ExecucaoFalhou` na Outbox na mesma transação. O payload implementado contém
+`orcamentoId`, `execucaoId` e `erro` (`codigo`, `mensagem`), como no contrato
+v1.1; `execucaoId` é nulo se `IniciarExecucao` falhar antes da criação da
+execução. A resposta preserva o `requestId` original e usa o `messageId` de
+`IniciarExecucao` como `causationId`. Nesse caso, `executionCompleted`
+permanece `false`, enquanto `outboxMessageType` informa `ExecucaoFalhou`. A
+CLI não cria uma mensagem nova para a Saga. A compatibilidade foi conferida
+contra o [schema v1.1.0 de `ExecucaoFalhou`](https://github.com/helyomendesdev/tech-challenge-oficina-saga/blob/v1.1.0/contrato/schemas/respostas/ExecucaoFalhou.schema.json),
+seu [exemplo oficial](https://github.com/helyomendesdev/tech-challenge-oficina-saga/blob/v1.1.0/contrato/exemplos/ExecucaoFalhou.json)
+e a [máquina de estados v1.1.0](https://github.com/helyomendesdev/tech-challenge-oficina-saga/blob/v1.1.0/contrato/saga-estados.yaml).
 
 Os exemplos são executados com os IDs reais de uma execução ativa: serviço deve
 pertencer à execução e cada peça/quantidade deve estar reservada e ainda

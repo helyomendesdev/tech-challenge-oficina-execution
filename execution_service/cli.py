@@ -13,6 +13,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from execution_service.application.service_execution_use_cases import ExecutionWorkUseCase
+from execution_service.domain.enums import SagaMessageType
 from execution_service.domain.exceptions import (
     ConcurrentExecutionUpdateError,
     MessageValidationError,
@@ -90,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
     finish = commands.add_parser("finish-service")
     _add_service_arguments(finish)
     finish.add_argument("--completed-at", type=_aware_datetime)
+
+    fail = commands.add_parser("fail-service")
+    _add_service_arguments(fail)
+    fail.add_argument("--error-code", required=True)
+    fail.add_argument("--error-message", required=True)
     return parser
 
 
@@ -139,11 +145,20 @@ def main(
                 request_id=args.request_id,
                 message_id=message_id,
             )
-        else:
+        elif args.command == "finish-service":
             result = work.finish_service(
                 args.saga_id,
                 args.service_id,
                 completed_at=args.completed_at,
+                request_id=args.request_id,
+                message_id=message_id,
+            )
+        else:
+            result = work.fail_service(
+                args.saga_id,
+                args.service_id,
+                args.error_code,
+                args.error_message,
                 request_id=args.request_id,
                 message_id=message_id,
             )
@@ -169,7 +184,10 @@ def main(
             "serviceStatus": result.status.value,
             "messageId": message_id,
             "duplicate": result.duplicate,
-            "executionCompleted": outbox is not None,
+            "executionCompleted": (
+                outbox is not None
+                and outbox.message.get("type") == SagaMessageType.EXECUCAO_FINALIZADA.value
+            ),
             "outboxMessageType": outbox.message.get("type") if outbox else None,
         },
     )
