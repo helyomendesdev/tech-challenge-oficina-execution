@@ -60,8 +60,42 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
         lifecycle: ExecutionLifecycle | None = None,
         expected_lifecycle_version: int | None = None,
     ) -> bool:
+        operations = self._command_operations(
+            record,
+            input_message_id,
+            input_fingerprint,
+            response,
+            expected_version,
+        )
+        lifecycle_put = self._lifecycle_put(
+            record.saga_id,
+            lifecycle,
+            expected_lifecycle_version,
+        )
+        if lifecycle_put is not None:
+            operations.append({"Put": lifecycle_put})
+
+        try:
+            self.client.transact_write_items(TransactItems=operations)
+        except ClientError as exc:
+            if self._handle_register_command_error(
+                exc,
+                input_message_id,
+                input_fingerprint,
+            ):
+                return False
+            raise
+        return True
+
+    def _command_operations(
+        self,
+        record: ExecutionRecord,
+        input_message_id: str,
+        input_fingerprint: str,
+        response: OutboxMessage,
+        expected_version: int | None,
+    ) -> list[dict[str, Any]]:
         message_key = f"MSG#{input_message_id}"
-        record_item = self._record_item(record)
         idempotency_item = {
             "pk": message_key,
             "sk": "IDEMPOTENCY",
@@ -69,24 +103,8 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
             "input_fingerprint": input_fingerprint,
             "saga_id": record.saga_id,
         }
-        record_condition = (
-            ATTRIBUTE_NOT_EXISTS_PK_CONDITION
-            if expected_version is None
-            else VERSION_MATCH_CONDITION
-        )
-        record_put: dict[str, Any] = {
-            "TableName": self.table_name,
-            "Item": self._serialize_item(record_item),
-            "ConditionExpression": record_condition,
-        }
-        if expected_version is not None:
-            record_put["ExpressionAttributeNames"] = {VERSION_ATTRIBUTE_NAME: "version"}
-            record_put["ExpressionAttributeValues"] = self._serialize_item(
-                {EXPECTED_VERSION_VALUE: expected_version}
-            )
-
-        operations: list[dict[str, Any]] = [
-            {"Put": record_put},
+        return [
+            {"Put": self._record_put(record, expected_version)},
             {
                 "Put": {
                     "TableName": self.table_name,
@@ -102,51 +120,83 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                 }
             },
         ]
-        if lifecycle is not None:
-            lifecycle_condition = (
+
+    def _record_put(
+        self,
+        record: ExecutionRecord,
+        expected_version: int | None,
+    ) -> dict[str, Any]:
+        record_condition = (
+            ATTRIBUTE_NOT_EXISTS_PK_CONDITION
+            if expected_version is None
+            else VERSION_MATCH_CONDITION
+        )
+        put: dict[str, Any] = {
+            "TableName": self.table_name,
+            "Item": self._serialize_item(self._record_item(record)),
+            "ConditionExpression": record_condition,
+        }
+        if expected_version is not None:
+            put["ExpressionAttributeNames"] = {VERSION_ATTRIBUTE_NAME: "version"}
+            put["ExpressionAttributeValues"] = self._serialize_item(
+                {EXPECTED_VERSION_VALUE: expected_version}
+            )
+        return put
+
+    def _lifecycle_put(
+        self,
+        saga_id: str,
+        lifecycle: ExecutionLifecycle | None,
+        expected_lifecycle_version: int | None,
+    ) -> dict[str, Any] | None:
+        if lifecycle is None:
+            if expected_lifecycle_version is not None:
+                raise ValueError("expected_lifecycle_version requires a lifecycle")
+            return None
+
+        lifecycle_put: dict[str, Any] = {
+            "TableName": self.table_name,
+            "Item": self._serialize_item(
+                self._lifecycle_item(
+                    saga_id,
+                    lifecycle,
+                    0 if expected_lifecycle_version is None else expected_lifecycle_version + 1,
+                )
+            ),
+            "ConditionExpression": (
                 ATTRIBUTE_NOT_EXISTS_PK_CONDITION
                 if expected_lifecycle_version is None
                 else VERSION_MATCH_CONDITION
+            ),
+        }
+        if expected_lifecycle_version is not None:
+            lifecycle_put["ExpressionAttributeNames"] = {VERSION_ATTRIBUTE_NAME: "version"}
+            lifecycle_put["ExpressionAttributeValues"] = self._serialize_item(
+                {EXPECTED_VERSION_VALUE: expected_lifecycle_version}
             )
-            lifecycle_put: dict[str, Any] = {
-                "TableName": self.table_name,
-                "Item": self._serialize_item(
-                    self._lifecycle_item(
-                        record.saga_id,
-                        lifecycle,
-                        0 if expected_lifecycle_version is None else expected_lifecycle_version + 1,
-                    )
-                ),
-                "ConditionExpression": lifecycle_condition,
-            }
-            if expected_lifecycle_version is not None:
-                lifecycle_put["ExpressionAttributeNames"] = {VERSION_ATTRIBUTE_NAME: "version"}
-                lifecycle_put["ExpressionAttributeValues"] = self._serialize_item(
-                    {EXPECTED_VERSION_VALUE: expected_lifecycle_version}
-                )
-            operations.append({"Put": lifecycle_put})
-        elif expected_lifecycle_version is not None:
-            raise ValueError("expected_lifecycle_version requires a lifecycle")
+        return lifecycle_put
 
-        try:
-            self.client.transact_write_items(TransactItems=operations)
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") not in {
-                "TransactionCanceledException",
-                "ConditionalCheckFailedException",
-            }:
-                raise
-            previous = self.get_input_fingerprint(input_message_id)
-            if previous is not None:
-                if previous != input_fingerprint:
-                    raise IdempotencyKeyReuseError(
-                        f"messageId={input_message_id} was reused with a different body"
-                    ) from exc
-                return False
-            raise ConcurrentExecutionUpdateError(
-                "Concurrent execution state change; retry the command"
-            ) from exc
-        return True
+    def _handle_register_command_error(
+        self,
+        error: ClientError,
+        input_message_id: str,
+        input_fingerprint: str,
+    ) -> bool:
+        if error.response.get("Error", {}).get("Code") not in {
+            "TransactionCanceledException",
+            "ConditionalCheckFailedException",
+        }:
+            return False
+        previous = self.get_input_fingerprint(input_message_id)
+        if previous is not None:
+            if previous != input_fingerprint:
+                raise IdempotencyKeyReuseError(
+                    f"messageId={input_message_id} was reused with a different body"
+                ) from error
+            return True
+        raise ConcurrentExecutionUpdateError(
+            "Concurrent execution state change; retry the command"
+        ) from error
 
     def load_lifecycle(self, saga_id: str) -> tuple[ExecutionLifecycle, int] | None:
         item = self._get_item(f"EXEC#{saga_id}", "LIFECYCLE")

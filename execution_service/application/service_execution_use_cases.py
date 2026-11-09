@@ -42,7 +42,26 @@ class _ServiceExecutionUseCase:
         inputs: dict[str, Any],
         change: Callable[[ExecutionLifecycle], ExecutionCompleted | ExecutionFailed | None],
     ) -> ServiceExecutionResult:
-        fingerprint = _fingerprint(
+        fingerprint = self._command_fingerprint(context, operation, inputs)
+        for _ in range(_COMMIT_ATTEMPTS):
+            duplicate = self._existing_command_result(context, fingerprint)
+            if duplicate is not None:
+                return duplicate
+            result = self._commit_attempt(context, fingerprint, inputs, change)
+            if result is not None:
+                return result
+
+        raise ConcurrentExecutionUpdateError(
+            f"Could not commit service command after {_COMMIT_ATTEMPTS} concurrent updates"
+        )
+
+    @staticmethod
+    def _command_fingerprint(
+        context: ServiceExecutionCommandContext,
+        operation: str,
+        inputs: dict[str, Any],
+    ) -> str:
+        return _fingerprint(
             {
                 "operation": operation,
                 "sagaId": context.saga_id,
@@ -52,57 +71,61 @@ class _ServiceExecutionUseCase:
                 "inputs": inputs,
             }
         )
-        for _ in range(_COMMIT_ATTEMPTS):
-            previous = self._repository.get_service_command_receipt(context.message_id)
-            if previous is not None:
-                return self._duplicate_result(context.message_id, fingerprint, previous)
 
-            loaded = self._repository.load_lifecycle(context.saga_id)
-            if loaded is None:
-                raise MessageValidationError(
-                    f"Execution lifecycle not found for sagaId={context.saga_id}"
-                )
-            lifecycle, version = loaded
-            if lifecycle.os_id != context.os_id or lifecycle.execution_id != context.execution_id:
-                raise MessageValidationError(
-                    "Command correlation does not match the execution lifecycle"
-                )
+    def _existing_command_result(
+        self,
+        context: ServiceExecutionCommandContext,
+        fingerprint: str,
+    ) -> ServiceExecutionResult | None:
+        previous = self._repository.get_service_command_receipt(context.message_id)
+        if previous is None:
+            return None
+        return self._duplicate_result(context.message_id, fingerprint, previous)
 
-            event = change(lifecycle)
-            status = lifecycle.service(inputs["serviceId"]).status
-            outbox = _service_event_outbox(context, event) if event is not None else None
-            execution_status = None
-            if isinstance(event, ExecutionFailed):
-                execution_status = ExecutionStatus.FALHOU
-            elif event is not None:
-                execution_status = ExecutionStatus.CONCLUIDA
-            try:
-                committed = self._repository.commit_service_command(
-                    lifecycle=lifecycle,
-                    message_id=context.message_id,
-                    fingerprint=fingerprint,
-                    status=status,
-                    outbox_message=outbox,
-                    expected_version=version,
-                    execution_status=execution_status,
-                )
-            except ConcurrentExecutionUpdateError:
-                continue
-
-            receipt = self._repository.get_service_command_receipt(context.message_id)
-            if receipt is None:
-                raise RuntimeError(
-                    "Service command receipt missing after commit for "
-                    f"messageId={context.message_id}"
-                )
-            return ServiceExecutionResult(
-                status=receipt.status,
-                duplicate=not committed,
-                outbox_message=receipt.outbox_message,
+    def _commit_attempt(
+        self,
+        context: ServiceExecutionCommandContext,
+        fingerprint: str,
+        inputs: dict[str, Any],
+        change: Callable[[ExecutionLifecycle], ExecutionCompleted | ExecutionFailed | None],
+    ) -> ServiceExecutionResult | None:
+        loaded = self._repository.load_lifecycle(context.saga_id)
+        if loaded is None:
+            raise MessageValidationError(
+                f"Execution lifecycle not found for sagaId={context.saga_id}"
+            )
+        lifecycle, version = loaded
+        if lifecycle.os_id != context.os_id or lifecycle.execution_id != context.execution_id:
+            raise MessageValidationError(
+                "Command correlation does not match the execution lifecycle"
             )
 
-        raise ConcurrentExecutionUpdateError(
-            f"Could not commit service command after {_COMMIT_ATTEMPTS} concurrent updates"
+        event = change(lifecycle)
+        status = lifecycle.service(inputs["serviceId"]).status
+        outbox = _service_event_outbox(context, event) if event is not None else None
+        execution_status = _execution_status(event)
+        try:
+            committed = self._repository.commit_service_command(
+                lifecycle=lifecycle,
+                message_id=context.message_id,
+                fingerprint=fingerprint,
+                status=status,
+                outbox_message=outbox,
+                expected_version=version,
+                execution_status=execution_status,
+            )
+        except ConcurrentExecutionUpdateError:
+            return None
+
+        receipt = self._repository.get_service_command_receipt(context.message_id)
+        if receipt is None:
+            raise RuntimeError(
+                f"Service command receipt missing after commit for messageId={context.message_id}"
+            )
+        return ServiceExecutionResult(
+            status=receipt.status,
+            duplicate=not committed,
+            outbox_message=receipt.outbox_message,
         )
 
     @staticmethod
@@ -336,6 +359,14 @@ class ExecutionWorkUseCase:
 def _fingerprint(command: dict[str, Any]) -> str:
     encoded = json.dumps(command, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _execution_status(event: ExecutionCompleted | ExecutionFailed | None) -> ExecutionStatus | None:
+    if isinstance(event, ExecutionFailed):
+        return ExecutionStatus.FALHOU
+    if event is not None:
+        return ExecutionStatus.CONCLUIDA
+    return None
 
 
 def _datetime_input(value: datetime) -> str:
