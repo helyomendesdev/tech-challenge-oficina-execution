@@ -48,36 +48,15 @@ class InMemoryExecutionRepository(ExecutionRepositoryPort):
         expected_lifecycle_version: int | None = None,
     ) -> bool:
         with self._lock:
-            old_fingerprint = self.fingerprints.get(input_message_id)
-            if old_fingerprint is not None:
-                if old_fingerprint != input_fingerprint:
-                    raise IdempotencyKeyReuseError(
-                        f"messageId={input_message_id} was reused with a different body"
-                    )
+            if not self._is_new_command(input_message_id, input_fingerprint):
                 return False
 
-            old_record = self.records.get(record.saga_id)
-            if expected_version is None:
-                if old_record is not None:
-                    raise RuntimeError("Concurrent execution state change; retry the command")
-            elif old_record is None or old_record.version != expected_version:
-                raise ConcurrentExecutionUpdateError(
-                    "Concurrent execution state change; retry the command"
-                )
-
-            old_lifecycle = self._lifecycles.get(record.saga_id)
-            if lifecycle is not None:
-                if expected_lifecycle_version is None:
-                    if old_lifecycle is not None:
-                        raise ConcurrentExecutionUpdateError(
-                            "Execution lifecycle already exists; retry the command"
-                        )
-                elif old_lifecycle is None or old_lifecycle[1] != expected_lifecycle_version:
-                    raise ConcurrentExecutionUpdateError(
-                        "Concurrent service execution state change; retry the command"
-                    )
-            elif expected_lifecycle_version is not None:
-                raise ValueError("expected_lifecycle_version requires a lifecycle")
+            self._validate_record_version(record.saga_id, expected_version)
+            self._validate_lifecycle_version(
+                record.saga_id,
+                lifecycle,
+                expected_lifecycle_version,
+            )
 
             self.fingerprints[input_message_id] = input_fingerprint
             self.records[record.saga_id] = deepcopy(record)
@@ -91,6 +70,46 @@ class InMemoryExecutionRepository(ExecutionRepositoryPort):
                 )
                 self._lifecycles[record.saga_id] = (lifecycle.clone(), version)
             return True
+
+    def _is_new_command(self, message_id: str, fingerprint: str) -> bool:
+        old_fingerprint = self.fingerprints.get(message_id)
+        if old_fingerprint is None:
+            return True
+        if old_fingerprint != fingerprint:
+            raise IdempotencyKeyReuseError(
+                f"messageId={message_id} was reused with a different body"
+            )
+        return False
+
+    def _validate_record_version(self, saga_id: str, expected_version: int | None) -> None:
+        old_record = self.records.get(saga_id)
+        if expected_version is None:
+            if old_record is not None:
+                raise RuntimeError("Concurrent execution state change; retry the command")
+        elif old_record is None or old_record.version != expected_version:
+            raise ConcurrentExecutionUpdateError(
+                "Concurrent execution state change; retry the command"
+            )
+
+    def _validate_lifecycle_version(
+        self,
+        saga_id: str,
+        lifecycle: ExecutionLifecycle | None,
+        expected_lifecycle_version: int | None,
+    ) -> None:
+        old_lifecycle = self._lifecycles.get(saga_id)
+        if lifecycle is not None:
+            if expected_lifecycle_version is None:
+                if old_lifecycle is not None:
+                    raise ConcurrentExecutionUpdateError(
+                        "Execution lifecycle already exists; retry the command"
+                    )
+            elif old_lifecycle is None or old_lifecycle[1] != expected_lifecycle_version:
+                raise ConcurrentExecutionUpdateError(
+                    "Concurrent service execution state change; retry the command"
+                )
+        elif expected_lifecycle_version is not None:
+            raise ValueError("expected_lifecycle_version requires a lifecycle")
 
     def register_failure_response(
         self,

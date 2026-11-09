@@ -19,6 +19,15 @@ from execution_service.domain.exceptions import (
 from execution_service.domain.models import ExecutionRecord
 from execution_service.domain.service_execution import ExecutionLifecycle, ServiceStatus
 
+ATTRIBUTE_NOT_EXISTS_PK_CONDITION = "attribute_not_exists(pk)"
+VERSION_ATTRIBUTE_NAME = "#version"
+STATUS_ATTRIBUTE_NAME = "#status"
+EXPECTED_VERSION_VALUE = ":expected_version"
+ACTIVE_STATUS_VALUE = ":active"
+VERSION_MATCH_CONDITION = f"{VERSION_ATTRIBUTE_NAME} = {EXPECTED_VERSION_VALUE}"
+ACTIVE_STATUS_CONDITION = f"{STATUS_ATTRIBUTE_NAME} = {ACTIVE_STATUS_VALUE}"
+VERSION_AND_ACTIVE_STATUS_CONDITION = f"{VERSION_MATCH_CONDITION} AND {ACTIVE_STATUS_CONDITION}"
+
 
 class DynamoDBExecutionRepository(ExecutionRepositoryPort):
     """Persists execution state, inbox keys, and outbox messages atomically."""
@@ -61,9 +70,9 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
             "saga_id": record.saga_id,
         }
         record_condition = (
-            "attribute_not_exists(pk)"
+            ATTRIBUTE_NOT_EXISTS_PK_CONDITION
             if expected_version is None
-            else "#version = :expected_version"
+            else VERSION_MATCH_CONDITION
         )
         record_put: dict[str, Any] = {
             "TableName": self.table_name,
@@ -71,9 +80,9 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
             "ConditionExpression": record_condition,
         }
         if expected_version is not None:
-            record_put["ExpressionAttributeNames"] = {"#version": "version"}
+            record_put["ExpressionAttributeNames"] = {VERSION_ATTRIBUTE_NAME: "version"}
             record_put["ExpressionAttributeValues"] = self._serialize_item(
-                {":expected_version": expected_version}
+                {EXPECTED_VERSION_VALUE: expected_version}
             )
 
         operations: list[dict[str, Any]] = [
@@ -82,22 +91,22 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                 "Put": {
                     "TableName": self.table_name,
                     "Item": self._serialize_item(idempotency_item),
-                    "ConditionExpression": "attribute_not_exists(pk)",
+                    "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                 }
             },
             {
                 "Put": {
                     "TableName": self.table_name,
                     "Item": self._serialize_item(self._outbox_item(input_message_id, response)),
-                    "ConditionExpression": "attribute_not_exists(pk)",
+                    "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                 }
             },
         ]
         if lifecycle is not None:
             lifecycle_condition = (
-                "attribute_not_exists(pk)"
+                ATTRIBUTE_NOT_EXISTS_PK_CONDITION
                 if expected_lifecycle_version is None
-                else "#version = :expected_version"
+                else VERSION_MATCH_CONDITION
             )
             lifecycle_put: dict[str, Any] = {
                 "TableName": self.table_name,
@@ -111,9 +120,9 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                 "ConditionExpression": lifecycle_condition,
             }
             if expected_lifecycle_version is not None:
-                lifecycle_put["ExpressionAttributeNames"] = {"#version": "version"}
+                lifecycle_put["ExpressionAttributeNames"] = {VERSION_ATTRIBUTE_NAME: "version"}
                 lifecycle_put["ExpressionAttributeValues"] = self._serialize_item(
-                    {":expected_version": expected_lifecycle_version}
+                    {EXPECTED_VERSION_VALUE: expected_lifecycle_version}
                 )
             operations.append({"Put": lifecycle_put})
         elif expected_lifecycle_version is not None:
@@ -197,10 +206,10 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                             expected_version + 1,
                         )
                     ),
-                    "ConditionExpression": "#version = :expected_version",
-                    "ExpressionAttributeNames": {"#version": "version"},
+                    "ConditionExpression": VERSION_MATCH_CONDITION,
+                    "ExpressionAttributeNames": {VERSION_ATTRIBUTE_NAME: "version"},
                     "ExpressionAttributeValues": self._serialize_item(
-                        {":expected_version": expected_version}
+                        {EXPECTED_VERSION_VALUE: expected_version}
                     ),
                 }
             },
@@ -217,7 +226,7 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                             "has_outbox": outbox_message is not None,
                         }
                     ),
-                    "ConditionExpression": "attribute_not_exists(pk)",
+                    "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                 }
             },
         ]
@@ -230,10 +239,10 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                         "Key": self._serialize_item(
                             {"pk": f"EXEC#{lifecycle.saga_id}", "sk": "RECORD"}
                         ),
-                        "ConditionExpression": "#status = :active",
-                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ConditionExpression": ACTIVE_STATUS_CONDITION,
+                        "ExpressionAttributeNames": {STATUS_ATTRIBUTE_NAME: "status"},
                         "ExpressionAttributeValues": self._serialize_item(
-                            {":active": ExecutionStatus.EM_EXECUCAO.value}
+                            {ACTIVE_STATUS_VALUE: ExecutionStatus.EM_EXECUCAO.value}
                         ),
                     }
                 }
@@ -247,15 +256,15 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                     "Put": {
                         "TableName": self.table_name,
                         "Item": self._serialize_item(self._record_item(record)),
-                        "ConditionExpression": "#version = :expected_version AND #status = :active",
+                        "ConditionExpression": VERSION_AND_ACTIVE_STATUS_CONDITION,
                         "ExpressionAttributeNames": {
-                            "#version": "version",
-                            "#status": "status",
+                            VERSION_ATTRIBUTE_NAME: "version",
+                            STATUS_ATTRIBUTE_NAME: "status",
                         },
                         "ExpressionAttributeValues": self._serialize_item(
                             {
-                                ":expected_version": record.version - 1,
-                                ":active": ExecutionStatus.EM_EXECUCAO.value,
+                                EXPECTED_VERSION_VALUE: record.version - 1,
+                                ACTIVE_STATUS_VALUE: ExecutionStatus.EM_EXECUCAO.value,
                             }
                         ),
                     }
@@ -266,7 +275,7 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                     "Put": {
                         "TableName": self.table_name,
                         "Item": self._serialize_item(self._outbox_item(message_id, outbox_message)),
-                        "ConditionExpression": "attribute_not_exists(pk)",
+                        "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                     }
                 }
             )
@@ -310,21 +319,21 @@ class DynamoDBExecutionRepository(ExecutionRepositoryPort):
                             "saga_id": saga_id,
                         }
                     ),
-                    "ConditionExpression": "attribute_not_exists(pk)",
+                    "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                 }
             },
             {
                 "Put": {
                     "TableName": self.table_name,
                     "Item": self._serialize_item(self._outbox_item(input_message_id, response)),
-                    "ConditionExpression": "attribute_not_exists(pk)",
+                    "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                 }
             },
             {
                 "ConditionCheck": {
                     "TableName": self.table_name,
                     "Key": self._serialize_item({"pk": f"EXEC#{saga_id}", "sk": "RECORD"}),
-                    "ConditionExpression": "attribute_not_exists(pk)",
+                    "ConditionExpression": ATTRIBUTE_NOT_EXISTS_PK_CONDITION,
                 }
             },
         ]
