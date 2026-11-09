@@ -6,6 +6,7 @@ from threading import Event
 from botocore.exceptions import BotoCoreError, ClientError
 
 from execution_service.application.ports import ExecutionRepositoryPort, MessagePublisherPort
+from execution_service.tracing import background_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +31,14 @@ class OutboxRelay:
                 raise RuntimeError("Pending outbox record is missing its input message id")
             message = outbox.message
             try:
-                self.publisher.publish(
-                    message,
-                    message_group_id=message["sagaId"],
-                    message_deduplication_id=message["messageId"],
-                    message_attributes=outbox.message_attributes,
-                )
-                self.repository.mark_outbox_published(outbox.input_message_id)
+                with background_transaction(message.get("type") or "PublicarResposta"):
+                    self.publisher.publish(
+                        message,
+                        message_group_id=message["sagaId"],
+                        message_deduplication_id=message["messageId"],
+                        message_attributes=outbox.message_attributes,
+                    )
+                    self.repository.mark_outbox_published(outbox.input_message_id)
                 published += 1
                 logger.info(
                     "execution_pending_outbox_published",
